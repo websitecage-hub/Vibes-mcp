@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """vibes.ai - full-featured CLI client for everything the web app can do.
 
-SINGLE-FILE build: the last saved meta_session cookie is embedded — on
-first run it materializes to ./session.json (if missing). The saved
-session persists there, so /login only happens when that cookie expires.
+SINGLE-FILE build with self-healing login: the newest working session is
+persisted (session.json + embedded copy inside this file), startup
+auto-logs-in when the saved cookie goes stale, mid-session 401s silently
+re-login, and /cookie <value> gives instant access from any browser.
 /mode /projects /use /img /v /ref /audio /lipsync /voices …
 """
 import io, json, os, sys, time, uuid, random, threading, re, base64
@@ -16,24 +17,64 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── embedded session cookie (materializes once into ./session.json) ─────
-_SESSION_PAYLOAD = r"""{
-  "meta_session": "7f3799aa-cdc0-47d8-8b37-d19d56883ce1.8oyWwsnCR2cw-ZRvdYM4Lo51tDYIEVpn2iZgn_s8IuA",
+# ── embedded session (materializes once into ./session.json) ────────────
+# auto-updated by save_session(): the newest WORKING session travels
+# inside this file, so copying it anywhere = instant login.
+_SESSION_PAYLOAD = r"""#_SP_BEGIN
+{
   "impersonate": "chrome",
-  "saved_at": 1786218337.052811
-}"""
+  "saved_at": 1787694366.0924575,
+  "cookies": [
+    {
+      "name": "meta_session",
+      "value": "7f3799aa-cdc0-47d8-8b37-d19d56883ce1.8oyWwsnCR2cw-ZRvdYM4Lo51tDYIEVpn2iZgn_s8IuA",
+      "domain": ".vibes.ai",
+      "path": "/"
+    },
+    {
+      "name": "cookie_ack",
+      "value": "true",
+      "domain": ".vibes.ai",
+      "path": "/"
+    }
+  ],
+  "meta_session": "7f3799aa-cdc0-47d8-8b37-d19d56883ce1.8oyWwsnCR2cw-ZRvdYM4Lo51tDYIEVpn2iZgn_s8IuA"
+}
+#_SP_END"""
 
 def _bootstrap_session():
     sf = os.path.join(ROOT_DIR, "session.json")
     if not os.path.exists(sf) or os.path.getsize(sf) < 20:
         try:
-            j = json.loads(_SESSION_PAYLOAD)
-            if isinstance(j, dict) and j.get("meta_session"):
+            raw = _SESSION_PAYLOAD
+            m = re.search(r"#_SP_BEGIN\s*(.*?)\s*#_SP_END", raw, re.S)
+            if m:
+                raw = m.group(1)
+            j = json.loads(raw)
+            if isinstance(j, dict) and (j.get("meta_session") or j.get("cookies")):
                 json.dump(j, open(sf, "w", encoding="utf-8"), indent=2)
         except Exception as e:  # noqa: BLE001
             print(f"[!] failed to materialize session.json: {e}")
 
 _bootstrap_session()
+
+def _update_embedded(payload_json):
+    """Rewrite the embedded session block inside THIS file (best effort)."""
+    try:
+        path = os.path.abspath(__file__)
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        i = src.find("#_SP_BEGIN")
+        j = src.find("#_SP_END", i)
+        if i == -1 or j == -1:
+            return False
+        head = src[:i + len("#_SP_BEGIN")]
+        tail = src[j:]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(head + "\n" + payload_json + "\n" + tail)
+        return True
+    except Exception:
+        return False
 
 # ── module proxies: `import auth` / `from client import Vibes` ───────────
 class _ModuleProxy(type(sys)):
@@ -65,8 +106,11 @@ PASSWORD = "Anshusingh99"
 APP_ID   = "1301537925115840"
 IMPERSONATE = "chrome"
 SESSION_FILE = os.path.join(ROOT_DIR, "session.json")
-UA = ("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36")
+# Coherent desktop identity: curl_cffi impersonate="chrome" already sends
+# desktop-Chrome TLS + client hints; pairing those with the old Android UA
+# read as a bot and tripped Meta's 4652001 "unrecognized device" checkpoint.
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 NAV = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
        "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "cross-site",
        "Upgrade-Insecure-Requests": "1"}
@@ -102,23 +146,53 @@ def parse(html):
             if k in qs: d[k] = qs[k][0]
     return d
 
-def login_session(print_fn=print):
-    """Full OIDC login against vibes.ai -> returns curl_cffi Session with meta_session cookie."""
+def _jar_list(s):
+    out = []
+    try:
+        for c in s.cookies.jar:
+            out.append({"name": c.name, "value": c.value,
+                        "domain": getattr(c, "domain", "") or "",
+                        "path": getattr(c, "path", "/") or "/"})
+    except Exception:
+        pass
+    return out
+
+def _seed_device_cookies(s):
+    """Restore every saved cookie (auth.meta.com device cookies included)
+    so a new login looks like the SAME browser Meta already recognizes."""
+    if not os.path.exists(SESSION_FILE):
+        return
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    for c in data.get("cookies", []):
+        try:
+            s.cookies.set(c["name"], c["value"],
+                          domain=c.get("domain") or ".vibes.ai",
+                          path=c.get("path") or "/")
+        except Exception:
+            pass
+
+def _login_once(p):
+    """One OIDC login attempt -> curl_cffi Session with meta_session, or None."""
     s = requests.Session(impersonate=IMPERSONATE)
+    _seed_device_cookies(s)
     wf = str(uuid.uuid4())
     r = s.get("https://vibes.ai/api/meta-oidc/start", params={"waterfall_id": wf},
-              headers={"User-Agent": UA}, allow_redirects=False)
+              headers={"User-Agent": UA}, allow_redirects=False, timeout=30)
     auth_url = r.headers.get("location", "")
     if not auth_url:
-        print_fn("[!] no auth redirect from /api/meta-oidc/start")
+        p("[!] no auth redirect from /api/meta-oidc/start")
         return None
 
-    r = s.get(auth_url, headers=NAV)
-    p = parse(r.text)
-    if not p["lsd"] or not p["pk"]:
-        print_fn("[!] auth page parse failed"); return None
-    lsd, jaz = p["lsd"], jazoest(p["lsd"])
-    enc, _ = encrypt_password(PASSWORD, p["pk"], p["keyId"])
+    r = s.get(auth_url, headers=NAV, timeout=30)
+    page = parse(r.text)
+    if not page["lsd"] or not page["pk"]:
+        p("[!] auth page parse failed"); return None
+    lsd, jaz = page["lsd"], jazoest(page["lsd"])
+    enc, _ = encrypt_password(PASSWORD, page["pk"], page["keyId"])
     s.cookies.set("ps_l", "1", domain=".auth.meta.com", path="/")
     s.cookies.set("ps_n", "1", domain=".auth.meta.com", path="/")
     payload = {"contact_point": EMAIL, "csi": str(uuid.uuid4()), "encrypted_account_id": "",
@@ -126,36 +200,66 @@ def login_session(print_fn=print):
                "native_sso_etoken": "", "nonce": "", "password": enc, "qpl_join_id": uuid.uuid4().hex[:17],
                "redirect_uri": auth_url, "source_app_id": APP_ID, "waterfall_id": wf,
                "caa_event_flow": "login_manual", "event_client_time": str(time.time()),
-               "event_step_login": "password", "__user": "0", "__a": "1", "__req": "w", "__hs": p["hs"],
-               "dpr": "3", "__ccg": "GOOD", "__rev": p["__rev"], "__s": p.get("__s", ""), "__hsi": p["hsi"],
-               "__dyn": p.get("__dyn", ""), "__csr": p.get("__csr", ""), "__hsdp": p.get("__hsdp", ""),
-               "__hblp": p.get("__hblp", ""), "__sjsp": p.get("__sjsp", ""), "__comet_req": "33",
-               "lsd": lsd, "jazoest": jaz, "__spin_r": p["__spin_r"], "__spin_b": "trunk",
-               "__spin_t": p["__spin_t"] or str(int(time.time())), "__jssesw": "1"}
+               "event_step_login": "password", "__user": "0", "__a": "1", "__req": "w", "__hs": page["hs"],
+               "dpr": "1", "__ccg": "GOOD", "__rev": page["__rev"], "__s": page.get("__s", ""), "__hsi": page["hsi"],
+               "__dyn": page.get("__dyn", ""), "__csr": page.get("__csr", ""), "__hsdp": page.get("__hsdp", ""),
+               "__hblp": page.get("__hblp", ""), "__sjsp": page.get("__sjsp", ""), "__comet_req": "33",
+               "lsd": lsd, "jazoest": jaz, "__spin_r": page["__spin_r"], "__spin_b": "trunk",
+               "__spin_t": page["__spin_t"] or str(int(time.time())), "__jssesw": "1"}
     r = s.post("https://auth.meta.com/api/login/", data=payload, headers={
         "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://auth.meta.com", "Referer": auth_url, "X-ASBD-ID": "359341",
         "X-FB-LSD": lsd, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"}, allow_redirects=False)
-    body = r.text; err = None
+        "Sec-Fetch-Site": "same-origin"}, allow_redirects=False, timeout=30)
+    body = r.text; err = None; reason = ""
     try:
         j = json.loads(body[body.index('{'):])
         err = j.get("error")
+        reason = str(j.get("error_reason") or "")[:160]
     except Exception: pass
     if err is not None:
-        print_fn(f"[!] login error {err}"); return None
+        code = err.get("code") if isinstance(err, dict) else err
+        p(f"[!] login error {code}  {reason}")
+        if str(code) == "4652001":
+            p("[!] Meta checkpoint 'unrecognized device' — one-time fix:")
+            p("    verify at https://auth.meta.com in your normal browser (log out & back in),")
+            p("    then run /login again. Instant alternative: /cookie <meta_session value>")
+        return None
     if r.status_code not in (200, 301, 302, 303):
-        print_fn(f"[!] login status {r.status_code}: {body[:200]}"); return None
+        p(f"[!] login status {r.status_code}: {body[:200]}"); return None
 
-    s.get(auth_url, headers=NAV, allow_redirects=True)
+    s.get(auth_url, headers=NAV, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
-        s.get("https://vibes.ai/", headers={"User-Agent": UA}, allow_redirects=True)
+        s.get("https://vibes.ai/", headers={"User-Agent": UA}, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
-        print_fn("[!] login ok but no meta_session cookie"); return None
+        p("[!] login ok but no meta_session cookie"); return None
+    # persist the FULL jar (device cookies make the next login recognized)
+    try:
+        save_session(s)
+    except Exception:
+        pass
     return s
 
+def login_session(print_fn=print, attempts=3):
+    """Password login with retries + backoff. Returns Session or None."""
+    p = print_fn if callable(print_fn) else (lambda *a: None)
+    last_exc = None
+    for i in range(attempts):
+        try:
+            s = _login_once(p)
+            if s is not None:
+                return s
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            p(f"[!] login attempt {i + 1}/{attempts} failed: {type(e).__name__} {e}")
+        if i < attempts - 1:
+            time.sleep(1.5 * (i + 1))
+    if last_exc:
+        p(f"[!] login failed after {attempts} attempts")
+    return None
+
 def load_session():
-    """Rehydrate a curl_cffi Session from session.json, or None."""
+    """Rehydrate a curl_cffi Session from session.json (full jar), or None."""
     if not os.path.exists(SESSION_FILE):
         return None
     try:
@@ -164,20 +268,33 @@ def load_session():
     except Exception:
         return None
     s = requests.Session(impersonate=data.get("impersonate", IMPERSONATE))
-    s.cookies.set("meta_session", data["meta_session"], domain=".vibes.ai", path="/")
+    for c in data.get("cookies", []):
+        try:
+            s.cookies.set(c["name"], c["value"],
+                          domain=c.get("domain") or ".vibes.ai",
+                          path=c.get("path") or "/")
+        except Exception:
+            pass
+    ms = data.get("meta_session")
+    if ms and not any(c.name == "meta_session" for c in s.cookies.jar):
+        s.cookies.set("meta_session", ms, domain=".vibes.ai", path="/")
     s.cookies.set("cookie_ack", "true", domain=".vibes.ai", path="/")
     return s
 
 def save_session(s):
-    data = {}
-    for c in s.cookies.jar:
-        if c.name == "meta_session":
-            data["meta_session"] = c.value
-    data["impersonate"] = IMPERSONATE
-    data["saved_at"] = time.time()
+    """Persist the whole cookie jar (not just meta_session) + update the
+    embedded copy inside this file so it logs in anywhere."""
+    data = {"impersonate": IMPERSONATE, "saved_at": time.time()}
+    ck = None
+    for c in _jar_list(s):
+        if c["name"] == "meta_session" and ck is None and c["value"]:
+            ck = c["value"]
+        data.setdefault("cookies", []).append(c)
+    data["meta_session"] = ck
     with open(SESSION_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    return data.get("meta_session")
+    _update_embedded(json.dumps(data, indent=2))
+    return ck
 
 def clear_session():
     if os.path.exists(SESSION_FILE):
@@ -258,9 +375,17 @@ class Vibes:
         self.user = None
         self.last_project = None
         self.reauth = reauth
-        self._cookie_once = False   # one silent re-login allowed
+        self._cookie_once = False   # one silent re-login allowed (legacy)
         self._reauth_once = True    # (kept for API compat)
         self._max_new_sessions = 3  # transport self-healing cap
+        self._reauth_lock = threading.Lock()
+        self._reauth_fails = 0      # consecutive silent re-login failures
+        self._saved_ck = None       # last meta_session persisted to disk
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                self._saved_ck = json.load(f).get("meta_session")
+        except Exception:
+            pass
         self.hdr = {"Accept": "*/*", "Content-Type": "application/json",
                     "Referer": "https://vibes.ai/"}
 
@@ -275,19 +400,27 @@ class Vibes:
         return self.s
 
     def _maybe_reauth(self):
-        if not self.reauth or self._cookie_once:
+        """Silent password re-login on 401 — thread-safe, repeatable
+        (capped at 5 consecutive failures, counter resets on success)."""
+        if not self.reauth:
             return False
-        self._cookie_once = True
-        try:
-            import auth as _auth
-            sess = _auth.login_session(print_fn=lambda *a: None)
-            if sess is None:
+        with self._reauth_lock:
+            if self._reauth_fails >= 5:
                 return False
-            _auth.save_session(sess)
-            self.s = sess
-            return True
-        except Exception:
-            return False
+            try:
+                import auth as _auth
+                sess = _auth.login_session(print_fn=lambda *a: None)
+                if sess is None:
+                    self._reauth_fails += 1
+                    return False
+                _auth.save_session(sess)
+                self.s = sess
+                self._saved_ck = _cookie_value(sess)
+                self._reauth_fails = 0
+                return True
+            except Exception:
+                self._reauth_fails += 1
+                return False
 
     # ── core transport ──
     def _req(self, method, path, tries=5, timeout=60, **kw):
@@ -337,6 +470,15 @@ class Vibes:
                     return j
                 raise VibesError(f"{method} {path}: {r.status_code} {r.text[:300]}",
                                  status=r.status_code)
+            # persist cookie rotations so the saved session never silently dies
+            try:
+                ck = _cookie_value(self.s)
+                if ck and ck != self._saved_ck:
+                    import auth as _auth
+                    if _auth.save_session(self.s):
+                        self._saved_ck = ck
+            except Exception:
+                pass
             break
         else:
             raise VibesError(f"{method} {path}: transport error after {tries} tries ({last_exc})")
@@ -1050,20 +1192,47 @@ def set_ref(path):
     print("[!] upload failed")
     return False
 
+def _fresh_client(quiet=False):
+    """Password-login and return a ready Vibes client (or None)."""
+    s = auth.login_session(print_fn=None if quiet else print)
+    if s is None:
+        return None
+    auth.save_session(s)
+    v = Vibes(s)
+    try:
+        u = v.me()
+        if not quiet:
+            print(f"[+] logged in as {u['username']} ({u['id'][:8]}…)")
+    except Exception:
+        pass
+    return v
+
 def dispatch(op, arg):
     global CUR, OREF, AUDIO, C
     v = C
     if op == "/login":
-        s = auth.login_session()
-        if s is None:
+        c = _fresh_client()
+        if c is not None:
+            C = c
+    elif op == "/cookie":
+        val = arg.strip().strip('"').strip("'")
+        if not val:
+            print("usage: /cookie <meta_session value>")
+            print("  copy the meta_session cookie from any logged-in vibes.ai browser")
+            print("  (DevTools → Application → Cookies → vibes.ai)")
+            return
+        s = requests.Session(impersonate=IMPERSONATE)
+        s.cookies.set("meta_session", val, domain=".vibes.ai", path="/")
+        s.cookies.set("cookie_ack", "true", domain=".vibes.ai", path="/")
+        probe = Vibes(s)
+        try:
+            u = probe.me()
+        except Exception as e:
+            print("[!] cookie rejected:", str(e)[:140])
             return
         auth.save_session(s)
-        C = Vibes(s)
-        try:
-            u = C.me()
-            print(f"[+] logged in as {u['username']} ({u['id'][:8]}…)")
-        except VibesError as e:
-            print("[!]", e)
+        C = probe
+        print(f"[+] logged in as {u['username']} ({u['id'][:8]}…) — session saved")
     elif op == "/logout":
         auth.clear_session()
         print("[.] session cleared")
@@ -1299,17 +1468,28 @@ def dispatch(op, arg):
 
 def repl():
     global C
+    C = None
     s = auth.load_session()
     if s:
-        C = Vibes(s)
+        probe = Vibes(s)
         try:
-            u = C.me()
+            u = probe.me()
+            C = probe
             print(f"[+] session: {u['username']}")
-        except (VibesError, Exception):
-            print("[!] saved session invalid — /login")
-            C = None
+        except Exception:
+            print("[.] saved session stale — logging in fresh…")
+    if C is None:
+        print("[*] automatic login (embedded account)…")
+        C = _fresh_client()
+    if C is None:
+        print("[!] automatic login blocked. Two fixes:")
+        print("    1) verify once at https://auth.meta.com in your normal browser, then /login")
+        print("    2) instant: /cookie <meta_session value>  (from any logged-in vibes.ai browser)")
     else:
-        print("[*] no saved session — /login")
+        try:
+            auth.save_session(C.s)   # keep file + embedded copy fresh
+        except Exception:
+            pass
     print("> type a prompt → generate videos (auto-save to vibes/media/)")
     print("> /help  /projects  /media  /voices  /img  /v  /ref /  /upload  /dl  /dup…")
     while True:
@@ -1325,8 +1505,8 @@ def repl():
             op, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
         else:
             op, arg = raw, ""          # plain text = prompt → video
-        if op not in ("/login", "/quit", "/help") and C is None:
-            print("[!] /login first")
+        if op not in ("/login", "/cookie", "/quit", "/exit", "/help") and C is None:
+            print("[!] /login first (or /cookie <value>)")
             continue
         try:
             if op.startswith("/"):
