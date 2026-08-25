@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 START_TIME = time.time()
 
@@ -289,7 +290,11 @@ def vibes_delete_media(item_id):
 
 # ── MCP server + tools ────────────────────────────────────────────────────
 
-mcp = FastMCP("media-gen", stateless_http=True, json_response=True)
+mcp = FastMCP(
+    "media-gen", stateless_http=True, json_response=True,
+    # public endpoint on Render: allow any Host (no auth by design)
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False))
 
 
 @mcp.tool()
