@@ -7,9 +7,17 @@ and **videos** (vibes.ai). Hosted on Render, kept alive 24/7 by UptimeRobot.
 
 | Tool | Backend | Returns |
 |---|---|---|
-| `generate_image(prompt)` | meta.ai | public image CDN URL(s) |
-| `generate_video(prompt, ..., reference_image_url)` | vibes.ai | public video CDN URL(s) |
-| `animate_image(image_url, prompt)` | vibes.ai i2v | video CDN URL |
+| `generate_image(prompt)` | meta.ai | inline image + CDN URL(s) |
+| `edit_image(image_url, instruction)` | meta.ai | edited image inline + URL |
+| `transparent_image(prompt)` | meta.ai | transparent PNG asset |
+| `make_gif(prompt)` | meta.ai | animated GIF |
+| `meta_chat(message)` | meta.ai | full suite: sandbox files, docs, conversions |
+| `web_search(query)` | meta.ai | cited web answer |
+| `deep_research(topic)` | meta.ai | structured report |
+| `social_search(query)` | meta.ai | IG/FB/Threads summary |
+| `places_search(query)` | meta.ai | places w/ address/hours/price |
+| `generate_video(prompt, ..., reference_image_url)` | vibes.ai | video URL(s) + poster preview |
+| `animate_image(image_url, prompt)` | vibes.ai i2v | video URL |
 | `create_lipsync(source_url, audio_url, prompt)` | vibes.ai | lip-synced video URL |
 | `list_voices()` | vibes.ai | TTS voice IDs |
 | `media_library(media_type, limit)` | vibes.ai | past media + IDs |
@@ -17,8 +25,9 @@ and **videos** (vibes.ai). Hosted on Render, kept alive 24/7 by UptimeRobot.
 | `delete_media(item_id)` | vibes.ai | ok |
 | `media_status()` | both | session health |
 
-Media is never stored on the server — backends return public CDN URLs, so
-nothing to clean up.
+Media delivery: images are embedded **inline** in the chat (MCP image
+content blocks) *and* returned as public CDN URLs for download. A hourly
+janitor purges stray temp files so Render's free disk never fills.
 
 ## Endpoints
 
