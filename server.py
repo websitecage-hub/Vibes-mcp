@@ -219,6 +219,17 @@ def _upload_ref(v, project, image_path):
     return oref
 
 
+def _vibes_with_fresh_login(fn, *args, **kw):
+    """Run a vibes operation; on 401 force a fresh login and retry once."""
+    try:
+        return fn(*args, **kw)
+    except vibes_mod.VibesError as e:
+        if e.status == 401:
+            _reset_vibes()
+            return fn(*args, **kw)
+        raise
+
+
 def _run_vibe_gen(prompt, aspect, resolution, model, n, max_sec,
                   reference_image_url=None, gen_kind="auto"):
     v = _get_vibes()
@@ -352,13 +363,70 @@ def _janitor_sweep():
     return removed
 
 
+def _refresh_vibes_session():
+    """Proactive re-login before the cookie expires."""
+    s = vibes_mod.auth.login_session(print_fn=lambda *a: None)
+    if s is not None:
+        vibes_mod.auth.save_session(s)
+        global _vibes_client
+        with _vibes_lock:
+            _vibes_client = vibes_mod.Vibes(s)
+        return True
+    return False
+
+
+async def _session_refresher_loop():
+    while True:
+        await asyncio.sleep(4 * 3600)
+        try:
+            await run_in_threadpool(_refresh_vibes_session)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def _janitor_loop():
     while True:
         try:
             await run_in_threadpool(_janitor_sweep)
+            now = time.time()
+            with _JOBS_LOCK:
+                stale = [k for k, v in JOBS.items()
+                         if now - v["created"] > 3600]
+                for k in stale:
+                    JOBS.pop(k, None)
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(3600)
+
+# ── async job system (dispatch + poll) ────────────────────────────────────
+
+JOBS: dict = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _start_job(kind, fn, *args):
+    """Run a long generation in a background thread; return job id at once."""
+    jid = uuid.uuid4().hex[:12]
+    with _JOBS_LOCK:
+        JOBS[jid] = {"id": jid, "kind": kind, "status": "running",
+                     "created": time.time(), "result": None}
+    def _run():
+        try:
+            r = fn(*args)
+        except Exception as e:  # noqa: BLE001
+            r = {"error": str(e)[:400]}
+        with _JOBS_LOCK:
+            JOBS[jid]["status"] = ("error" if isinstance(r, dict)
+                                   and r.get("error") else "done")
+            JOBS[jid]["result"] = r
+    threading.Thread(target=_run, daemon=True).start()
+    return jid
+
+
+def _job_snapshot(jid):
+    with _JOBS_LOCK:
+        rec = JOBS.get(jid)
+        return dict(rec) if rec else None
 
 # ── MCP server + tools ────────────────────────────────────────────────────
 
@@ -372,11 +440,16 @@ mcp = FastMCP(
 
 @mcp.tool()
 async def generate_image(prompt: str) -> list:
-    """Generate image(s) from a text prompt using Meta AI.
-    Returns the image rendered INLINE plus public download URLs.
+    """CREATE a brand-new IMAGE from a TEXT description using Meta AI.
+    ALWAYS use this when the user wants to create/make/generate/draw a
+    picture, photo, artwork, logo, poster, sticker or any visual — it works
+    fully from text, no source image needed. The result is returned inline
+    (visible in chat) plus public download URLs. Takes ~10-30s.
 
     Args:
-        prompt: Description of the image to create. Be detailed for best results.
+        prompt: Full description of the image: subject, style, lighting,
+            mood, colors. Example: 'golden retriever puppy wearing
+            sunglasses on a beach at sunset, photorealistic'.
     """
     try:
         res = await meta_ask("/imagine " + prompt, timeout=180)
@@ -457,90 +530,64 @@ async def make_gif(prompt: str) -> list:
 @mcp.tool()
 async def generate_video(prompt: str, aspect_ratio: str = "9:16",
                          resolution: str = "480p", model: str = "",
-                         count: int = 1, reference_image_url: str = "") -> list:
-    """Generate video(s) from a text prompt using Vibes AI.
-    Returns video download URLs (+ poster preview where available).
-    Takes ~30s-5min per clip.
+                         count: int = 1, reference_image_url: str = "") -> str:
+    """CREATE a brand-new VIDEO from a TEXT description (no image needed).
+    Use this whenever the user wants a new video made from scratch.
+    For an ad/clip/scene: just describe it. Animating an existing photo?
+    Put the photo URL in reference_image_url.
+
+    ASYNC: returns a job_id IMMEDIATELY. Then call check_generation(job_id)
+    every ~20s until status is "done" (takes 1-5 min).
 
     Args:
-        prompt: Description of the video to create.
+        prompt: Description of the video to create (subject, motion, style).
         aspect_ratio: One of 9:16, 16:9, 1:1, 4:5, 3:4, 4:3.
         resolution: 480p (fast), 720p, or 1080p (slowest).
         model: Optional: midjen-short (fast), midjen-long, midjen, sora, veo.
         count: How many variations (1-4).
-        reference_image_url: Optional public image URL. When given, the video
-            animates FROM that image (image-to-video).
+        reference_image_url: Optional. Public URL of an image to animate
+            (image-to-video). Leave empty for pure text-to-video.
     """
-    try:
-        res = await run_in_threadpool(
-            _run_vibe_gen, prompt, aspect_ratio, resolution,
-            model or None, count, 360, reference_image_url or None, "t2v")
-    except Exception as e:  # noqa: BLE001
-        return [TextContent(type="text", text=f"ERROR: {e}")]
-    ok = [i for i in res["items"] if "url" in i]
-    bad = [i for i in res["items"] if "error" in i]
-    if bad and not ok:
-        return [TextContent(type="text",
-                            text="All items failed:\n"
-                                 + "\n".join(f"- {b['error']}" for b in bad)
-                                 + "\nTip: retry or rephrase the prompt.")]
-    header = f"Generated {len(ok)} video(s):"
-    lines = [header]
-    thumbs = []
-    for i in ok:
-        name = os.path.basename(i["url"].split("?")[0]) or "video.mp4"
-        lines.append(f"- [{name}]({i['url']})")
-        if i.get("thumb"):
-            thumbs.append(i["thumb"])
-    tip = ("\nTip: open the link to watch/download the mp4."
-           if ok else "")
-    blocks = [TextContent(type="text", text="\n".join(lines) + tip)]
-    for t in thumbs[:2]:
-        blk = _embed_media_block(t)
-        if blk is not None:
-            blocks.append(blk)
-    return blocks
+    jid = _start_job("video", _vibes_with_fresh_login, _run_vibe_gen, prompt,
+                     aspect_ratio, resolution, model or None,
+                     max(1, min(4, count)), 420,
+                     reference_image_url or None, "t2v")
+    return (f"Video generation STARTED.\njob_id: {jid}\n"
+            f"NEXT STEP: call check_generation(\"{jid}\") — wait ~20 seconds "
+            f"between calls until status is \"done\" (typically 60-240s).")
 
 
 @mcp.tool()
 async def animate_image(image_url: str, prompt: str = "",
                         aspect_ratio: str = "9:16",
-                        resolution: str = "480p") -> list:
-    """Turn an existing image into a short video (image-to-video).
+                        resolution: str = "480p") -> str:
+    """Turn an EXISTING image into a short video (image-to-video).
+
+    ASYNC: returns a job_id IMMEDIATELY. Then call check_generation(job_id)
+    every ~20s until status is "done" (takes 1-5 min).
 
     Args:
-        image_url: Public URL of the source image.
+        image_url: Public URL of the source image to animate.
         prompt: How the scene should move (optional).
-        aspect_ratio: Output ratio, defaults to source shape (9:16).
+        aspect_ratio: Output ratio (9:16 default).
         resolution: 480p, 720p, or 1080p.
     """
-    try:
-        res = await run_in_threadpool(
-            _run_vibe_gen, prompt or "animate this image", aspect_ratio,
-            resolution, None, 1, 420, image_url, "i2v")
-    except Exception as e:  # noqa: BLE001
-        return [TextContent(type="text", text=f"ERROR: {e}")]
-    ok = [i for i in res["items"] if "url" in i]
-    lines = ["Animated image -> video:"]
-    thumbs = []
-    for i in ok:
-        name = os.path.basename(i["url"].split("?")[0]) or "video.mp4"
-        lines.append(f"- [{name}]({i['url']})")
-        if i.get("thumb"):
-            thumbs.append(i["thumb"])
-    blocks = [TextContent(type="text", text="\n".join(lines))]
-    for t in thumbs[:2]:
-        blk = _embed_media_block(t)
-        if blk is not None:
-            blocks.append(blk)
-    return blocks
+    jid = _start_job("animate", _vibes_with_fresh_login, _run_vibe_gen,
+                     prompt or "animate this image", aspect_ratio,
+                     resolution, None, 1, 420, image_url, "i2v")
+    return (f"Image animation STARTED.\njob_id: {jid}\n"
+            f"NEXT STEP: call check_generation(\"{jid}\") — wait ~20 seconds "
+            f"between calls until status is \"done\".")
 
 
 @mcp.tool()
 async def create_lipsync(source_url: str, audio_url: str,
                          prompt: str = "", aspect_ratio: str = "9:16",
-                         resolution: str = "480p") -> list:
+                         resolution: str = "480p") -> str:
     """Lip-sync a source face/image/video to an audio track.
+
+    ASYNC: returns a job_id IMMEDIATELY. Then call check_generation(job_id)
+    every ~20s until status is "done" (takes 2-7 min).
 
     Args:
         source_url: Public URL of the face/source image or video.
@@ -549,17 +596,53 @@ async def create_lipsync(source_url: str, audio_url: str,
         aspect_ratio: Output ratio (9:16 default).
         resolution: 480p, 720p, or 1080p.
     """
-    try:
-        res = await run_in_threadpool(
-            vibes_lipsync, source_url, audio_url, prompt, aspect_ratio,
-            resolution)
-    except Exception as e:  # noqa: BLE001
-        return [TextContent(type="text", text=f"ERROR: {e}")]
-    ok = [i for i in res["items"] if "url" in i]
-    lines = ["Lipsync complete:"]
+    jid = _start_job("lipsync", _vibes_with_fresh_login, vibes_lipsync,
+                     source_url, audio_url, prompt, aspect_ratio, resolution)
+    return (f"Lipsync STARTED.\njob_id: {jid}\n"
+            f"NEXT STEP: call check_generation(\"{jid}\") — wait ~30 seconds "
+            f"between calls until status is \"done\".")
+
+
+@mcp.tool()
+async def check_generation(job_id: str) -> list:
+    """Check the result of a video/animation/lipsync job started with
+    generate_video, animate_image or create_lipsync.
+
+    Args:
+        job_id: The job_id returned when the generation was started.
+    """
+    rec = _job_snapshot(job_id)
+    if rec is None:
+        return [TextContent(type="text",
+                            text=f"ERROR: unknown job_id {job_id} "
+                                 f"(jobs expire after 1 hour).")]
+    if rec["status"] == "running":
+        waited = int(time.time() - rec["created"])
+        return [TextContent(type="text",
+                            text=f"status: running ({waited}s elapsed). "
+                                 f"Call check_generation again in ~20s.")]
+    if rec["status"] == "error":
+        return [TextContent(type="text",
+                            text=f"status: FAILED\n{rec['result'].get('error', '')}")]
+    items = rec["result"].get("items", [])
+    ok = [i for i in items if "url" in i]
+    bad = [i for i in items if "error" in i]
+    lines = ["status: DONE"]
+    thumbs = []
     for i in ok:
-        lines.append(f"- {i['url']}")
-    return [TextContent(type="text", text="\n".join(lines))]
+        kind = i.get("type", "media")
+        name = os.path.basename(i["url"].split("?")[0]) or f"{kind}"
+        lines.append(f"- [{name} ({kind})]({i['url']})")
+        if i.get("thumb"):
+            thumbs.append(i["thumb"])
+    for i in bad:
+        lines.append(f"- FAILED item: {i['error']}")
+    blocks = [TextContent(type="text", text="\n".join(lines))]
+    for t in thumbs[:2]:
+        blk = _embed_media_block(t)
+        if blk is not None:
+            blocks.append(blk)
+    return blocks
 
 # ── meta.ai capability suite ─────────────────────────────────────────────
 
@@ -759,8 +842,10 @@ mcp_app = mcp.streamable_http_app()
 async def lifespan(app):
     async with mcp.session_manager.run():
         task = asyncio.create_task(_janitor_loop())
+        refresh = asyncio.create_task(_session_refresher_loop())
         yield
         task.cancel()
+        refresh.cancel()
 
 
 app = FastAPI(title="media-gen-mcp", lifespan=lifespan)
@@ -775,16 +860,178 @@ async def root():
         "mcp_endpoint": "/mcp",
         "tools": [
             "generate_image", "edit_image", "transparent_image", "make_gif",
-            "generate_video", "animate_image", "create_lipsync",
-            "meta_chat", "web_search", "deep_research", "social_search",
-            "places_search", "list_voices", "media_library",
+            "generate_video", "check_generation", "animate_image",
+            "create_lipsync", "meta_chat", "web_search", "deep_research",
+            "social_search", "places_search", "list_voices", "media_library",
             "favorite_media", "delete_media", "media_status"],
+        "web_app": "/app",
     })
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return JSONResponse({"ok": True, "uptime_s": int(time.time() - START_TIME)})
+
+# ── REST API for the web app ─────────────────────────────────────────────
+
+from fastapi import Request
+from fastapi.responses import HTMLResponse
+
+
+@app.post("/api/image")
+async def api_image(req: Request):
+    try:
+        body = await req.json()
+        prompt = str(body.get("prompt", "")).strip()
+        if not prompt:
+            return JSONResponse({"error": "prompt required"}, status_code=400)
+        res = await meta_ask("/imagine " + prompt, timeout=180)
+        urls = [m["url"] for m in res["media"] if m.get("url")]
+        return JSONResponse({"urls": urls})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:300]}, status_code=500)
+
+
+@app.post("/api/video")
+async def api_video(req: Request):
+    try:
+        body = await req.json()
+        prompt = str(body.get("prompt", "")).strip()
+        if not prompt:
+            return JSONResponse({"error": "prompt required"}, status_code=400)
+        jid = _start_job("video", _run_vibe_gen, prompt,
+                         body.get("aspect_ratio", "9:16"),
+                         body.get("resolution", "480p"), None,
+                         int(body.get("count", 1)), 420,
+                         body.get("reference_image_url") or None, "t2v")
+        return JSONResponse({"job_id": jid})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:300]}, status_code=500)
+
+
+@app.get("/api/job/{job_id}")
+async def api_job(job_id: str):
+    rec = _job_snapshot(job_id)
+    if rec is None:
+        return JSONResponse({"error": "unknown job"}, status_code=404)
+    out = {"id": rec["id"], "kind": rec["kind"], "status": rec["status"],
+           "elapsed_s": int(time.time() - rec["created"])}
+    if rec["result"]:
+        out["items"] = rec["result"].get("items")
+        out["error"] = rec["result"].get("error")
+    return JSONResponse(out)
+
+# ── web app ───────────────────────────────────────────────────────────────
+
+_APP_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Media Gen Studio</title>
+<style>
+  :root{--bg:#0a0a0a;--card:#111214;--border:#262626;--txt:#ededed;--dim:#8f8f8f;--accent:#0070f3}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font-family:Inter,-apple-system,'Segoe UI',Roboto,sans-serif;
+       min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px}
+  .wrap{width:100%;max-width:760px}
+  h1{font-size:28px;font-weight:600;letter-spacing:-.5px}
+  .sub{color:var(--dim);font-size:14px;margin-top:6px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:24px;margin-top:28px}
+  .tabs{display:flex;gap:4px;background:#161618;border-radius:10px;padding:4px;width:fit-content}
+  .tab{padding:7px 18px;border-radius:8px;font-size:13.5px;color:var(--dim);cursor:pointer;border:none;background:none}
+  .tab.on{background:#2c2c2e;color:#fff}
+  textarea{width:100%;background:#0d0d0e;border:1px solid var(--border);border-radius:10px;color:var(--txt);
+           padding:14px;font-size:14.5px;resize:vertical;min-height:96px;margin-top:18px;font-family:inherit}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  .opts{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+  select{background:#0d0d0e;border:1px solid var(--border);color:var(--txt);border-radius:8px;padding:9px 12px;font-size:13px}
+  button.go{margin-top:16px;background:#fff;color:#000;border:none;border-radius:10px;padding:11px 26px;
+            font-size:14px;font-weight:600;cursor:pointer;transition:.15s}
+  button.go:hover{background:#e5e5e5}button.go:disabled{opacity:.45;cursor:wait}
+  input.url{width:100%;background:#0d0d0e;border:1px solid var(--border);border-radius:10px;color:var(--txt);
+            padding:11px 13px;font-size:13.5px;margin-top:12px}
+  #msg{margin-top:14px;font-size:13.5px;color:var(--dim);min-height:20px}
+  #msg.err{color:#f87171}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-top:22px}
+  .grid img,.grid video{width:100%;border-radius:12px;border:1px solid var(--border);display:block;background:#000}
+  a.dl{font-size:12px;color:var(--accent);text-decoration:none;display:inline-block;margin-top:6px}
+  footer{margin-top:auto;padding-top:60px;color:#555;font-size:12px;text-align:center}
+</style></head><body>
+<div class="wrap">
+  <h1>Media Gen Studio</h1>
+  <div class="sub">Images by Meta AI &middot; Videos by Vibes AI</div>
+  <div class="card">
+    <div class="tabs">
+      <button class="tab on" data-m="image">Image</button>
+      <button class="tab" data-m="video">Video</button>
+      <button class="tab" data-m="animate">Animate image</button>
+    </div>
+    <textarea id="prompt" placeholder="Describe what you want to create..."></textarea>
+    <input class="url" id="refurl" placeholder="https://image-url-to-animate.jpg" style="display:none">
+    <div class="opts">
+      <select id="aspect">
+        <option value="1:1">1:1 square</option><option value="9:16">9:16 vertical</option>
+        <option value="16:9">16:9 wide</option><option value="4:5">4:5 post</option>
+      </select>
+      <select id="res">
+        <option value="480p">480p fast</option><option value="720p">720p</option>
+        <option value="1080p">1080p slow</option>
+      </select>
+    </div>
+    <button class="go" id="go">Generate</button>
+    <div id="msg"></div>
+    <div class="grid" id="grid"></div>
+  </div>
+</div>
+<footer>media-gen-mcp &middot; free tier &middot; videos take 1-5 min</footer>
+<script>
+let MODE='image';
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+  t.classList.add('on');MODE=t.dataset.m;
+  document.getElementById('refurl').style.display=MODE==='animate'?'block':'none';
+  document.getElementById('res').style.display=MODE==='image'?'none':'block';
+});
+const $=id=>document.getElementById(id);
+function addImg(u){const d=document.createElement('div');
+  d.innerHTML=`<img src="${u}"><a class="dl" href="${u}" target="_blank" download>Download</a>`;
+  $('grid').prepend(d);}
+function addVid(u){const d=document.createElement('div');
+  d.innerHTML=`<video src="${u}" controls muted playsinline></video><a class="dl" href="${u}" target="_blank" download>Download</a>`;
+  $('grid').prepend(d);}
+async function poll(jid){const r=await fetch('/api/job/'+jid);
+  const j=await r.json();
+  if(j.status==='running'){$('msg').textContent=`Generating... ${j.elapsed_s}s`;setTimeout(()=>poll(jid),8000);return;}
+  $('go').disabled=false;
+  if(j.status==='error'||j.error){$('msg').textContent=j.error||'failed';$('msg').className='err';return;}
+  $('msg').textContent='Done!';
+  (j.items||[]).forEach(it=>{if(it.videoUrl)addVid(it.videoUrl);else if(it.imageUrl)addImg(it.imageUrl);});
+}
+$('go').onclick=async()=>{
+  const p=$('prompt').value.trim();if(!p)return;
+  $('go').disabled=true;$('msg').className='';$('msg').textContent='Starting...';
+  try{
+    if(MODE==='image'){
+      const r=await fetch('/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p})});
+      const j=await r.json();$('go').disabled=false;
+      if(j.error){$('msg').textContent=j.error;$('msg').className='err';return;}
+      $('msg').textContent='Done!';j.urls.forEach(addImg);
+    }else{
+      const body={prompt:p,aspect_ratio:$('aspect').value,resolution:$('res').value};
+      if(MODE==='animate'){body.reference_image_url=$('refurl').value.trim();body.prompt=p;}
+      const r=await fetch('/api/video',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j=await r.json();if(j.error){$('msg').textContent=j.error;$('msg').className='err';$('go').disabled=false;return;}
+      poll(j.job_id);
+    }
+  }catch(e){$('msg').textContent=String(e);$('msg').className='err';$('go').disabled=false;}
+};
+</script></body></html>"""
+
+
+@app.get("/app", response_class=HTMLResponse)
+@app.api_route("/app", methods=["GET", "HEAD"])
+async def web_app():
+    return HTMLResponse(_APP_HTML)
+
 
 
 # MCP transport last, so / and /health always win
