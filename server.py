@@ -488,7 +488,7 @@ async def lifespan(app):
 app = FastAPI(title="media-gen-mcp", lifespan=lifespan)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return JSONResponse({
         "service": "media-gen-mcp",
@@ -501,7 +501,7 @@ async def root():
     })
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return JSONResponse({"ok": True, "uptime_s": int(time.time() - START_TIME)})
 
