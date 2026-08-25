@@ -1,0 +1,1349 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""vibes.ai - full-featured CLI client for everything the web app can do.
+
+SINGLE-FILE build: the last saved meta_session cookie is embedded — on
+first run it materializes to ./session.json (if missing). The saved
+session persists there, so /login only happens when that cookie expires.
+/mode /projects /use /img /v /ref /audio /lipsync /voices …
+"""
+import io, json, os, sys, time, uuid, random, threading, re, base64
+from datetime import datetime
+from urllib.parse import parse_qs
+from curl_cffi import requests
+from nacl.public import SealedBox, PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── embedded session cookie (materializes once into ./session.json) ─────
+_SESSION_PAYLOAD = r"""{
+  "meta_session": "7f3799aa-cdc0-47d8-8b37-d19d56883ce1.8oyWwsnCR2cw-ZRvdYM4Lo51tDYIEVpn2iZgn_s8IuA",
+  "impersonate": "chrome",
+  "saved_at": 1786218337.052811
+}"""
+
+def _bootstrap_session():
+    sf = os.path.join(ROOT_DIR, "session.json")
+    if not os.path.exists(sf) or os.path.getsize(sf) < 20:
+        try:
+            j = json.loads(_SESSION_PAYLOAD)
+            if isinstance(j, dict) and j.get("meta_session"):
+                json.dump(j, open(sf, "w", encoding="utf-8"), indent=2)
+        except Exception as e:  # noqa: BLE001
+            print(f"[!] failed to materialize session.json: {e}")
+
+_bootstrap_session()
+
+# ── module proxies: `import auth` / `from client import Vibes` ───────────
+class _ModuleProxy(type(sys)):
+    def __getattr__(self, name):
+        g = globals()
+        if name in g:
+            return g[name]
+        raise AttributeError(name)
+
+for _m in ("auth", "client"):
+    sys.modules[_m] = _ModuleProxy(_m)
+
+# HERE was removed from the merged REPL; keep the name for /dl etc.
+HERE = ROOT_DIR
+
+
+# ── auth (merged) ──────────────────────────────────────────────
+"""vibes.ai auth — same Meta auth bypass as main.py (encrypted password via auth.meta.com OIDC).
+Login -> get meta_session cookie -> save to session.json. /login /logout /cookie
+"""
+import re, time, uuid, base64, os, json, sys
+from urllib.parse import parse_qs
+from curl_cffi import requests
+from nacl.public import SealedBox, PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+EMAIL    = "anshuminded@gmail.com"
+PASSWORD = "Anshusingh99"
+APP_ID   = "1301537925115840"
+IMPERSONATE = "chrome"
+SESSION_FILE = os.path.join(ROOT_DIR, "session.json")
+UA = ("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36")
+NAV = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+       "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "cross-site",
+       "Upgrade-Insecure-Requests": "1"}
+
+def encrypt_password(password, pub_hex, key_id):
+    ts = int(time.time()); aes_key = os.urandom(32)
+    sealed = bytes(SealedBox(PublicKey(bytes.fromhex(pub_hex))).encrypt(aes_key))
+    ct_tag = AESGCM(aes_key).encrypt(bytes(12), password.encode(), str(ts).encode())
+    ct, tag = ct_tag[:-16], ct_tag[-16:]
+    buf = bytes([1, int(key_id) & 0xff]) + len(sealed).to_bytes(2, "little") + sealed + tag + ct
+    return f"#PWD_BROWSER:5:{ts}:{base64.b64encode(buf).decode()}", len(buf)
+
+def jazoest(lsd): return "2" + str(sum(ord(c) for c in lsd))
+
+def parse(html):
+    d = {}
+    m = re.search(r'\["LSD",\s*\[\],\s*\{"token"\s*:\s*"([^"]+)"', html)
+    if not m: m = re.search(r'"lsd"\s*:\s*"([^"]+)"', html, re.I)
+    d["lsd"] = m.group(1) if m else None
+    m = re.search(r'"publicKey"\s*:\s*"([a-f0-9]{64})"', html); d["pk"] = m.group(1) if m else None
+    m = re.search(r'"keyId"\s*:\s*"?(\d+)"?', html); d["keyId"] = int(m.group(1)) if m else 1
+    m = re.search(r'"haste_session"\s*:\s*"([^"]+)"', html); d["hs"] = m.group(1) if m else ""
+    m = re.search(r'"hsi"\s*:\s*"(\d+)"', html); d["hsi"] = m.group(1) if m else ""
+    for k, p in {"__rev": r'"server_revision"\s*:\s*(\d+)', "__rev2": r'"client_revision"\s*:\s*(\d+)',
+                 "__spin_t": r'"__spin_t"\s*:\s*(\d+)', "__spin_r": r'"__spin_r"\s*:\s*(\d+)',
+                 "__s": r'"__s"\s*:\s*"([^"]+)"'}.items():
+        m = re.search(p, html); d[k] = m.group(1) if m else ""
+    d["__rev"] = d["__rev"] or d["__rev2"] or d["__spin_r"]
+    bz = re.search(r'/ajax/bz\?([^"\'>\s]+)', html)
+    if bz:
+        qs = parse_qs(bz.group(1))
+        for k in ("__dyn", "__csr", "__hsdp", "__hblp", "__sjsp"):
+            if k in qs: d[k] = qs[k][0]
+    return d
+
+def login_session(print_fn=print):
+    """Full OIDC login against vibes.ai -> returns curl_cffi Session with meta_session cookie."""
+    s = requests.Session(impersonate=IMPERSONATE)
+    wf = str(uuid.uuid4())
+    r = s.get("https://vibes.ai/api/meta-oidc/start", params={"waterfall_id": wf},
+              headers={"User-Agent": UA}, allow_redirects=False)
+    auth_url = r.headers.get("location", "")
+    if not auth_url:
+        print_fn("[!] no auth redirect from /api/meta-oidc/start")
+        return None
+
+    r = s.get(auth_url, headers=NAV)
+    p = parse(r.text)
+    if not p["lsd"] or not p["pk"]:
+        print_fn("[!] auth page parse failed"); return None
+    lsd, jaz = p["lsd"], jazoest(p["lsd"])
+    enc, _ = encrypt_password(PASSWORD, p["pk"], p["keyId"])
+    s.cookies.set("ps_l", "1", domain=".auth.meta.com", path="/")
+    s.cookies.set("ps_n", "1", domain=".auth.meta.com", path="/")
+    payload = {"contact_point": EMAIL, "csi": str(uuid.uuid4()), "encrypted_account_id": "",
+               "is_contact_point_encrypted": "false", "is_parental_consent_flow": "false",
+               "native_sso_etoken": "", "nonce": "", "password": enc, "qpl_join_id": uuid.uuid4().hex[:17],
+               "redirect_uri": auth_url, "source_app_id": APP_ID, "waterfall_id": wf,
+               "caa_event_flow": "login_manual", "event_client_time": str(time.time()),
+               "event_step_login": "password", "__user": "0", "__a": "1", "__req": "w", "__hs": p["hs"],
+               "dpr": "3", "__ccg": "GOOD", "__rev": p["__rev"], "__s": p.get("__s", ""), "__hsi": p["hsi"],
+               "__dyn": p.get("__dyn", ""), "__csr": p.get("__csr", ""), "__hsdp": p.get("__hsdp", ""),
+               "__hblp": p.get("__hblp", ""), "__sjsp": p.get("__sjsp", ""), "__comet_req": "33",
+               "lsd": lsd, "jazoest": jaz, "__spin_r": p["__spin_r"], "__spin_b": "trunk",
+               "__spin_t": p["__spin_t"] or str(int(time.time())), "__jssesw": "1"}
+    r = s.post("https://auth.meta.com/api/login/", data=payload, headers={
+        "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://auth.meta.com", "Referer": auth_url, "X-ASBD-ID": "359341",
+        "X-FB-LSD": lsd, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin"}, allow_redirects=False)
+    body = r.text; err = None
+    try:
+        j = json.loads(body[body.index('{'):])
+        err = j.get("error")
+    except Exception: pass
+    if err is not None:
+        print_fn(f"[!] login error {err}"); return None
+    if r.status_code not in (200, 301, 302, 303):
+        print_fn(f"[!] login status {r.status_code}: {body[:200]}"); return None
+
+    s.get(auth_url, headers=NAV, allow_redirects=True)
+    if not any(c.name == "meta_session" for c in s.cookies.jar):
+        s.get("https://vibes.ai/", headers={"User-Agent": UA}, allow_redirects=True)
+    if not any(c.name == "meta_session" for c in s.cookies.jar):
+        print_fn("[!] login ok but no meta_session cookie"); return None
+    return s
+
+def load_session():
+    """Rehydrate a curl_cffi Session from session.json, or None."""
+    if not os.path.exists(SESSION_FILE):
+        return None
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    s = requests.Session(impersonate=data.get("impersonate", IMPERSONATE))
+    s.cookies.set("meta_session", data["meta_session"], domain=".vibes.ai", path="/")
+    s.cookies.set("cookie_ack", "true", domain=".vibes.ai", path="/")
+    return s
+
+def save_session(s):
+    data = {}
+    for c in s.cookies.jar:
+        if c.name == "meta_session":
+            data["meta_session"] = c.value
+    data["impersonate"] = IMPERSONATE
+    data["saved_at"] = time.time()
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return data.get("meta_session")
+
+def clear_session():
+    if os.path.exists(SESSION_FILE):
+        os.remove(SESSION_FILE)
+
+# ── client (merged) ────────────────────────────────────────────
+"""vibes.ai client — full API surface discovered from the live web app (JS bundles + HAR + live probing).
+Drives everything the web lets you do: text-to-video, image-to-video, image generation,
+lip sync, animating, editing, voices/TTS, music, ingredients (characters/styles/scenes),
+projects CRUD+duplicate+assets, media library, favorites, batch/content management, exports.
+Requires an authenticated curl_cffi Session (auth.login_session() / auth.load_session()).
+"""
+import json, os, time, uuid, random, threading
+from datetime import datetime
+from curl_cffi import requests
+
+API = "https://vibes.ai/api"
+
+class VibesError(Exception):
+    """A surfaced API or transport failure. `code` mirrors the server error code
+    (e.g. GENERATION_FAILED) when available; `status` is the HTTP status."""
+    def __init__(self, message, code=None, status=None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+class _ThreadSession:
+    """Context manager: one curl_cffi Session per thread (safe for parallel downloads)."""
+    def __init__(self, cookie):
+        self.cookie = cookie
+    def __enter__(self):
+        s = getattr(_thread_local, "sess", None)
+        if s is None:
+            s = _mk_curl(cookie=self.cookie)
+            _thread_local.sess = s
+        return s
+    def __exit__(self, *a):
+        return False
+
+_thread_local = threading.local()
+
+def _mk_curl(cookie=None, impersonate="chrome"):
+    s = requests.Session(impersonate=impersonate)
+    if cookie:
+        s.cookies.set("meta_session", cookie, domain=".vibes.ai", path="/")
+        s.cookies.set("cookie_ack", "true", domain=".vibes.ai", path="/")
+    return s
+
+def _cookie_value(session):
+    try:
+        for c in session.cookies.jar:
+            if c.name == "meta_session":
+                return c.value
+    except Exception:
+        pass
+    return None
+
+def thread_session(self):
+    return _ThreadSession(_cookie_value(self.s))
+
+def _now_iso():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+def _uuid_uuid():
+    return uuid.uuid4().hex
+
+API_BASE = API
+
+ASPECT_RATIOS = ["9:16", "1:1", "16:9", "4:5", "3:4", "4:3"]
+# allowed video/image models seen in the web app configs:
+PROMPT_MODELS = ["gemini-2.5-flash", "midjen"]
+IMAGE_MODELS = ["midjen-base", "midjen", "sd", "imagen", "dall-e"]
+VIDEO_MODELS = ["midjen-short", "midjen-long", "midjen", "meta-juggernaut", "sora", "veo"]
+
+class Vibes:
+    def __init__(self, s, reauth=True):
+        self.s = s
+        self.user = None
+        self.last_project = None
+        self.reauth = reauth
+        self._cookie_once = False   # one silent re-login allowed
+        self._reauth_once = True    # (kept for API compat)
+        self._max_new_sessions = 3  # transport self-healing cap
+        self.hdr = {"Accept": "*/*", "Content-Type": "application/json",
+                    "Referer": "https://vibes.ai/"}
+
+    # ── transport self-healing ──
+    def _rebuild_session(self):
+        """Drop a poisoned curl session and start fresh (HTTP/2 framing bugs, timeouts)."""
+        try:
+            self.s.close()
+        except Exception:
+            pass
+        self.s = _mk_curl(cookie=_cookie_value(self.s))
+        return self.s
+
+    def _maybe_reauth(self):
+        if not self.reauth or self._cookie_once:
+            return False
+        self._cookie_once = True
+        try:
+            import auth as _auth
+            sess = _auth.login_session(print_fn=lambda *a: None)
+            if sess is None:
+                return False
+            _auth.save_session(sess)
+            self.s = sess
+            return True
+        except Exception:
+            return False
+
+    # ── core transport ──
+    def _req(self, method, path, tries=5, timeout=60, **kw):
+        last_exc = None
+        for attempt in range(tries):
+            try:
+                r = self.s.request(method, API + path, headers=self.hdr, timeout=timeout, **kw)
+            except Exception as e:
+                last_exc = e
+                if attempt >= tries - 1:
+                    break
+                self._rebuild_session()          # likely HTTP/2 framing / dead pool
+                time.sleep(0.5 + 0.5 * attempt * random.random())
+                continue
+            # 401 → silent re-login once, then retry the same request
+            if r.status_code == 401:
+                if self._maybe_reauth():
+                    continue
+                raise VibesError(f"{method} {path}: 401 not authenticated", status=401)
+            ct = r.headers.get("content-type", "")
+            if r.status_code == 429:
+                retry = r.headers.get("retry-after")
+                delay = float(retry) if retry else 2.0 + attempt
+                if attempt >= tries - 1:
+                    break
+                time.sleep(min(delay, 15))
+                continue
+            if r.status_code == 500:
+                try:
+                    j = r.json()
+                except ValueError:
+                    j = None
+                if isinstance(j, dict) and j.get("success") is False and j.get("error"):
+                    return j
+                if attempt < tries - 1:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+            if r.status_code >= 400:
+                if "<!DOCTYPE html" in (r.text or "")[:200]:
+                    raise VibesError(f"{method} {path}: {r.status_code} (route not found)",
+                                     status=r.status_code)
+                try:
+                    j = r.json()
+                except ValueError:
+                    j = None
+                if isinstance(j, dict) and j.get("success") is False and j.get("error"):
+                    return j
+                raise VibesError(f"{method} {path}: {r.status_code} {r.text[:300]}",
+                                 status=r.status_code)
+            break
+        else:
+            raise VibesError(f"{method} {path}: transport error after {tries} tries ({last_exc})")
+        if "json" in ct or (r.text and r.text[:1] in "[{'"):
+            try:
+                return r.json()
+            except Exception:
+                pass
+        return r.text
+
+    def _j(self, method, path, **kw):
+        kw.setdefault("timeout", 60)
+        return self._req(method, path, **kw)
+
+    # ── auth / account ──
+    def me(self):
+        j = self._j("GET", "/auth/me")
+        if isinstance(j, dict) and "user" in j:
+            self.user = j["user"]
+            return self.user
+        raise VibesError("not authenticated", status=401)
+
+    def check_token(self):
+        j = self._j("GET", "/auth/check-token")
+        return j.get("user") if isinstance(j, dict) else None
+
+    def logout(self):
+        return self._j("POST", "/auth/logout", json={})
+
+    def geo(self):
+        return self._j("GET", "/dev/geo")
+
+    def system_status(self):
+        j = self._j("GET", "/system-status")
+        return j if isinstance(j, dict) else {}
+
+    # ── projects ──
+    def list_projects(self, limit=25, offset=0, sort="newest", search=None):
+        q = f"limit={limit}&offset={offset}&sort={sort}"
+        if search:
+            q += "&search=" + search
+        j = self._j("GET", f"/projects?{q}")
+        return (j or {}).get("projects", []) if isinstance(j, dict) else []
+
+    def get_project(self, pid):
+        j = self._j("GET", f"/projects/{pid}")
+        return j.get("project") if isinstance(j, dict) else None
+
+    def create_project(self, name="Untitled"):
+        j = self._j("POST", "/projects", json={"name": name})
+        return j.get("project") if isinstance(j, dict) else None
+
+    def update_project(self, pid, fields):
+        """PUT project. Web app uses this for name / composition (fingerprint optimistic concurrency)."""
+        j = self._j("PUT", f"/projects/{pid}", json=fields)
+        if isinstance(j, dict):
+            return j.get("project")
+        return None
+
+    def rename_project(self, pid, name):
+        return self.update_project(pid, {"name": name})
+
+    def save_composition(self, pid, composition):
+        return self.update_project(pid, {"composition": composition})
+
+    def delete_project(self, pid, delete_assets=True):
+        q = "?deleteAssets=true" if delete_assets else ""
+        return self._j("DELETE", f"/projects/{pid}{q}")
+
+    def duplicate_project(self, pid):
+        j = self._j("POST", f"/projects/{pid}/duplicate", json={})
+        return j.get("project") if isinstance(j, dict) else None
+
+    def project_assets(self, pid):
+        j = self._j("GET", f"/projects/{pid}/assets")
+        return j.get("assets", []) if isinstance(j, dict) else []
+
+    def add_project_asset(self, pid, content_item_id, relationship=None):
+        body = {"contentItemId": content_item_id}
+        if relationship:
+            body["relationship"] = relationship
+        j = self._j("POST", f"/projects/{pid}/assets", json=body)
+        return j.get("projectAsset") if isinstance(j, dict) else j
+
+    def remove_project_asset(self, pid, content_item_id):
+        return self._j("DELETE", f"/projects/{pid}/assets/{content_item_id}")
+
+    def project_batches(self, pid, limit=25, offset=0):
+        j = self._j("GET", f"/projects/{pid}/batches?limit={limit}&offset={offset}")
+        return ((j.get("batches", []), j.get("nextOffset")) if isinstance(j, dict)
+                else ([], None))
+
+    def project_timeline_export_pending(self, pid):
+        j = self._j("GET", f"/projects/{pid}/timeline/export/pending")
+        return j.get("pending") if isinstance(j, dict) else None
+
+    def all_assets(self):
+        """Global asset stream across projects (web: project-assets)."""
+        j = self._j("GET", "/project-assets")
+        return j.get("items", []) if isinstance(j, dict) else []
+
+    # ── media library ──
+    def media_library(self, types=None, limit=25, offset=0, favorites_only=False, favorites=None):
+        """types: comma list of video,images,audio,gallery (server also accepts 'gallery'/'image')."""
+        q = f"limit={limit}&offset={offset}"
+        if types:
+            q += f"&types={types}"
+        elif favorites:
+            q += f"&favorites={favorites}"
+        if favorites_only:
+            q += "&favoritesOnly=true"
+        j = self._j("GET", f"/media-library?{q}")
+        return ((j.get("items", []), j.get("page")) if isinstance(j, dict) else ([], None))
+
+    # ── studio: voices, ingredients ──
+    def studio_voices(self, limit=100):
+        j = self._j("GET", f"/studio/voices?limit={limit}")
+        return j.get("voices", []) if isinstance(j, dict) else []
+
+    def studio_ingredients(self, owner="LIBRARY", cursor=None):
+        """Ingredients: CHARACTER / STYLE / SCENE reusable assets. owner: LIBRARY or VIEWER."""
+        q = f"ownerFilter={owner}"
+        if cursor:
+            q += f"&cursor={cursor}"
+        j = self._j("GET", f"/studio/ingredients?{q}")
+        return ((j.get("ingredients", []), j.get("pageInfo")) if isinstance(j, dict)
+                else ([], None))
+
+    # ── uploads ──
+    def _mime_for(self, filename):
+        ext = os.path.splitext(filename)[1].lower().lstrip(".")
+        m = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+             "webp": "image/webp", "gif": "image/gif", "mp4": "video/mp4",
+             "mov": "video/quicktime", "webm": "video/webm", "mp3": "audio/mpeg",
+             "wav": "audio/wav", "m4a": "audio/mp4"}
+        return m.get(ext, "application/octet-stream")
+
+    def _mp(self, path, multipart, expect_json=True):
+        """Hardened multipart POST: self-healing retries like _req."""
+        last = None
+        for attempt in range(4):
+            try:
+                r = self.s.post(API + path, multipart=multipart,
+                                headers={"Accept": "*/*", "Referer": "https://vibes.ai/"},
+                                timeout=300)
+                if r.status_code >= 400:
+                    raise VibesError(f"POST {path}: {r.status_code} {r.text[:200]}",
+                                     status=r.status_code)
+                if expect_json:
+                    return r.json()
+                return r.text
+            except Exception as e:
+                last = e
+                self._rebuild_session()
+                time.sleep(0.6 * (attempt + 1))
+        raise VibesError(f"POST {path}: upload failed after retries ({last})")
+
+    def upload_media(self, path):
+        """POST /api/upload-media — the standard image/video upload."""
+        fn = os.path.basename(path)
+        from curl_cffi import CurlMime
+        m = CurlMime()
+        m.addpart("file", content_type=self._mime_for(fn), filename=fn, local_path=path)
+        j = self._mp("/upload-media", m, expect_json=True)
+        j["filename"] = fn
+        return j
+
+    def upload_video_direct(self, path):
+        """POST /api/upload-video-direct — upload an mp4 to the media library directly."""
+        fn = os.path.basename(path)
+        from curl_cffi import CurlMime
+        m = CurlMime()
+        m.addpart("video", content_type=self._mime_for(fn), filename=fn, local_path=path)
+        j = self._mp("/upload-video-direct", m, expect_json=True)
+        j["filename"] = fn
+        return j
+
+    def upload_audio_direct(self, path):
+        """POST /api/upload-audio-direct — upload audio (voiceover/vocals) • multipart field 'audio'."""
+        fn = os.path.basename(path)
+        from curl_cffi import CurlMime
+        m = CurlMime()
+        m.addpart("audio", content_type=self._mime_for(fn), filename=fn, local_path=path)
+        j = self._mp("/upload-audio-direct", m, expect_json=True)
+        j["filename"] = fn
+        return j
+
+    def upload_music_to_oil(self, path):
+        """POST /api/upload-music-to-oil — hand a track off to the OIL (music) pipeline."""
+        fn = os.path.basename(path)
+        from curl_cffi import CurlMime
+        m = CurlMime()
+        m.addpart("music", content_type=self._mime_for(fn), filename=fn, local_path=path)
+        return self._mp("/upload-music-to-oil", m, expect_json=True)
+
+    def upload_asset(self, data_url_image):
+        """POST /api/upload-asset — upload a base64 data-URL image. Returns {mediaEntId,imageUrl}."""
+        j = self._j("POST", "/upload-asset", json={"image": data_url_image})
+        return j if isinstance(j, dict) else {}
+
+    def upload_profile_picture(self, path):
+        fn = os.path.basename(path)
+        from curl_cffi import CurlMime
+        m = CurlMime()
+        m.addpart("file", content_type=self._mime_for(fn), filename=fn, local_path=path)
+        return self._mp("/upload-profile-picture", m, expect_json=True)
+
+    def project_upload(self, pid, media):
+        body = {"files": [{
+            "mediaEntId": media["mediaEntId"], "uploadToken": media.get("uploadToken"),
+            "cdnUrl": media.get("cdnUrl"), "filename": media.get("filename", "upload.png"),
+            "dimensions": media.get("dimensions", {}),
+            "aspectRatio": media.get("aspectRatio", "1:1")}]}
+        j = self._j("POST", f"/projects/{pid}/upload", json=body)
+        return j.get("contentItems", []) if isinstance(j, dict) else []
+
+    # ── generation ──
+    def make_batch(self, project, prompt, n=4, aspect="9:16", prompt_model="gemini-2.5-flash",
+                   image_model="midjen-base", video_model="midjen-short", resolution="720p",
+                   oref=None, batch_type="videos"):
+        """Create optimistic batch like the web app (POST /api/generation-batches). Returns batchId."""
+        bid = "batch-" + _uuid_uuid()
+        items = [{"id": f"{bid}-content-{i}", "type": batch_type, "isLoading": True}
+                 for i in range(n)]
+        cfg = {"directGeneration": True, "promptModel": prompt_model, "aspectRatio": aspect,
+               "imageModel": image_model, "videoModel": video_model, "resolution": resolution,
+               "batchVariation": True}
+        if isinstance(oref, dict):
+            cfg["oref_image_ent_id"] = oref.get("mediaEntId")
+            cfg["oref_image_url"] = oref.get("cdnUrl")
+            cfg["promptSegments"] = [{"segmentType": "reference_image", "text": "reference image"}]
+            cfg["sourceContentItemIds"] = [{"id": oref.get("_id"), "source": "oref"}]
+        ts = _now_iso()
+        body = {"id": bid, "type": batch_type, "prompt": prompt or " ", "timestamp": ts,
+                "content": items, "isComplete": False, "config": cfg}
+        self._j("POST", "/generation-batches", json=body)
+        return bid
+
+    def generate_videos(self, project, prompt, batch_id, oref=None, aspect="9:16",
+                        prompt_model="gemini-2.5-flash", image_model="midjen-base",
+                        video_model="midjen-short", resolution="720p", n=4,
+                        generation_type="t2v", segments=None, extra=None):
+        """POST /api/generate/videos — the main generation endpoint (t2v/i2v/oref).
+        segments: optional list of {segmentType, text} prompt segments (web composer feature).
+        extra: extra config keys merged into top-level config.
+        """
+        cfg = {"directGeneration": True, "promptModel": prompt_model, "aspectRatio": aspect,
+               "imageModel": image_model, "videoModel": video_model, "resolution": resolution,
+               "batchVariation": True}
+        if isinstance(oref, dict):
+            cfg["oref_image_ent_id"] = oref.get("mediaEntId")
+            cfg["oref_image_url"] = oref.get("cdnUrl")
+            cfg["promptSegments"] = segments or [{"segmentType": "reference_image", "text": prompt}]
+            cfg["sourceContentItemIds"] = [{"id": oref.get("_id"), "source": "oref"}]
+        elif segments:
+            cfg["promptSegments"] = segments
+        if isinstance(extra, dict):
+            cfg.update(extra)
+        inp = {"type": "prompt", "value": prompt, "original_prompt": prompt, "config": cfg}
+        inputs = [dict(inp) for _ in range(max(1, n))]
+        body = {"inputs": inputs, "config": {**cfg, "generationType": generation_type},
+                "batchId": batch_id, "mg_request_id": "www-" + _uuid_uuid(),
+                "projectId": project["id"] if isinstance(project, dict) else project}
+        return self._j("POST", "/generate/videos", json=body)
+
+    def generate_images(self, project, batch_id, prompt, n=4, aspect="1:1",
+                       prompt_model="gemini-2.5-flash", image_model="midjen-base",
+                       video_model="midjen-short", resolution="720p", oref=None,
+                       segments=None, extra=None):
+        """POST /api/generate/images — image generation (still frames/plates)."""
+        cfg = {"directGeneration": True, "promptModel": prompt_model, "aspectRatio": aspect,
+               "imageModel": image_model, "videoModel": video_model, "resolution": resolution,
+               "batchVariation": True}
+        if isinstance(oref, dict):
+            cfg["oref_image_ent_id"] = oref.get("mediaEntId")
+            cfg["oref_image_url"] = oref.get("cdnUrl")
+            cfg["sourceContentItemIds"] = [{"id": oref.get("_id"), "source": "oref"}]
+        if isinstance(segments, list):
+            cfg["promptSegments"] = segments
+        if isinstance(extra, dict):
+            cfg.update(extra)
+        body = {"inputs": [{"type": "prompt", "value": prompt, "original_prompt": prompt,
+                            "config": cfg}],
+                "config": {**cfg, "generationType": "image"},
+                "batchId": batch_id, "mg_request_id": "www-" + _uuid_uuid(),
+                "projectId": project["id"]}
+        return self._j("POST", "/generate/images", json=body)
+
+    def generate_lipsync(self, project, batch_id, audio_media_id, source_content_id, prompt="",
+                         n=1, aspect="9:16", prompt_model="gemini-2.5-flash",
+                         image_model="midjen-base", video_model="midjen-short",
+                         resolution="720p", extra=None):
+        """Lip-sync: pair an uploaded audio track with a content item's imagery."""
+        cfg = {"directGeneration": True, "promptModel": prompt_model, "aspectRatio": aspect,
+               "imageModel": image_model, "videoModel": video_model, "resolution": resolution,
+               "batchVariation": True,
+               "audioMediaEntId": audio_media_id,
+               "sourceContentItemIds": [{"id": source_content_id, "source": "video"}],
+               "type": "lipsync"}
+        if isinstance(extra, dict):
+            cfg.update(extra)
+        inputs = [{"type": "prompt", "value": prompt, "original_prompt": prompt, "config": cfg}]
+        body = {"inputs": inputs, "config": {**cfg, "generationType": "lipsync"},
+                "batchId": batch_id, "mg_request_id": "www-" + _uuid_uuid(),
+                "projectId": project["id"]}
+        return self._j("POST", "/generate/videos", json=body)
+
+    def stream_batch(self, batch_id, timeout=90):
+        url = API + f"/generation-batches/{batch_id}/stream"
+        r = self.s.get(url, headers=self.hdr, stream=True, timeout=timeout)
+        items = []
+        try:
+            for raw in r.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                line = raw.strip()
+                if line.startswith("data:"):
+                    try:
+                        j = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+                    if isinstance(j, dict) and "items" in j:
+                        items = j["items"]
+                        if j.get("isComplete"):
+                            break
+        except Exception:
+            pass
+        return items
+
+    def get_batch(self, batch_id):
+        j = self._j("GET", f"/generation-batches/{batch_id}")
+        return j.get("batch") if isinstance(j, dict) else None
+
+    def delete_batch(self, batch_id):
+        return self._j("DELETE", f"/generation-batches/{batch_id}")
+
+    def update_batch(self, body):
+        return self._j("PUT", "/generation-batches", json=body)
+
+    def retry_item(self, item_id):
+        return self._j("POST", f"/content-items/{item_id}/retry", json={})
+
+    def gen_batch_status(self, batch_id):
+        j = self._j("GET", f"/generation-batches/{batch_id}/stream", timeout=5)
+        return j if isinstance(j, dict) else None
+
+    # ── high-level generation (single call: submit → wait → result) ──
+    def wait_generation(self, batch_id, want="video", max_sec=420, poll=1.0, project=None,
+                        on_tick=None):
+        """Wait until every item in a batch is final (videoUrl/imageUrl or error).
+
+        Adaptive polling: 1s until the first third of the budget, then up to 3s.
+        on_tick(batch_dict) is invoked each poll (for progress display).
+        Returns the final content list; raises VibesError on timeout."""
+        t0 = time.time()
+        while time.time() - t0 < max_sec:
+            contents = None
+            b = None
+            try:
+                b = self.get_batch(batch_id)
+                contents = (b or {}).get("content") if isinstance(b, dict) else None
+            except Exception:
+                contents = None
+            if not contents and project:
+                try:
+                    batches, _ = self.project_batches(project["id"] if isinstance(project, dict)
+                                                      else project, limit=50)
+                    b = next((x for x in batches if x.get("id") == batch_id), None)
+                    contents = (b or {}).get("content") or []
+                except Exception:
+                    contents = []
+            if contents:
+                if on_tick:
+                    on_tick(b or {})
+                n_ready = 0
+                all_err = True
+                for x in contents:
+                    url = x.get("videoUrl") if want == "video" else x.get("imageUrl")
+                    if x.get("error"):
+                        n_ready += 1
+                        continue
+                    if url:
+                        n_ready += 1
+                    else:
+                        all_err = False
+                if n_ready == len(contents):
+                    return contents
+                if b and isinstance(b, dict) and b.get("isComplete") and n_ready == 0:
+                    return contents
+            elapsed = time.time() - t0
+            delay = poll if elapsed < max_sec / 3 else min(poll * 3, 3.0)
+            time.sleep(delay)
+        raise VibesError(f"generation {batch_id} did not finish in {max_sec}s", status=None)
+
+    def generate(self, project, prompt, n=1, aspect="9:16", resolution="480p", kind="videos",
+                 model=None, oref=None, extra=None, generation_type="t2v",
+                 max_sec=420, on_tick=None):
+        """Full pipeline: make batch → submit → wait → return final content items.
+        Returns (items, batch_id). Auto-retries GENERATION_FAILED once per the web-app
+        behavior (retry_item → re-submit)."""
+        vm = model or "midjen-short"
+        pid = project["id"] if isinstance(project, dict) else project
+        self.last_project = project
+
+        def submit(bid=None):
+            if bid is None:
+                bid = self.make_batch(project, prompt, n=n, aspect=aspect, oref=oref,
+                                      video_model=vm, resolution=resolution, batch_type=kind)
+            res = self.generate_videos(project, prompt, bid, n=n, aspect=aspect,
+                                       resolution=resolution, video_model=vm, oref=oref,
+                                       extra=extra, generation_type=generation_type)
+            return bid, res
+
+        bid, res = submit()
+        if isinstance(res, dict) and res.get("success") is False:
+            err = res.get("error") or {}
+            if err.get("code") == "GENERATION_FAILED":
+                hard = _hard_reject(res, err)
+                if hard:
+                    # server refused the prompt itself (content/relevance policy).
+                    # no retry_item / re-submit: just surface the failed items quickly
+                    try:
+                        return self.wait_generation(
+                            bid, want="images" if kind == "images" else "video",
+                            max_sec=20, project=project), bid
+                    except VibesError:
+                        b = self.get_batch(bid)
+                        return ((b or {}).get("content") or []), bid
+                ids = [it.get("id") for it in (res.get("items") or []) if it.get("id")]
+                if not ids:
+                    try:
+                        b = self.get_batch(bid)
+                        ids = [x.get("id") for x in (b or {}).get("content") or []
+                               if x.get("id")]
+                    except Exception:
+                        ids = []
+                ok = 0
+                for iid in ids:
+                    try:
+                        j = self.retry_item(iid)
+                        if isinstance(j, dict) and j.get("success"):
+                            ok += 1
+                    except Exception:
+                        continue
+                if ok == 0:
+                    bid, res = submit(bid)
+        items = self.wait_generation(bid, want="images" if kind == "images" else "video",
+                                     max_sec=max_sec, project=project, on_tick=on_tick)
+        return items, bid
+
+    # ── content items ──
+    def content_items(self, limit=50, favorites=None, batch_id=None, project_id=None):
+        q = f"limit={limit}"
+        if favorites is not None:
+            q += f"&favoritesOnly={str(favorites).lower()}"
+        if batch_id:
+            q += f"&batchId={batch_id}"
+        if project_id:
+            q += f"&projectId={project_id}"
+        j = self._j("GET", f"/content-items?{q}")
+        return j.get("contentItems", []) if isinstance(j, dict) else []
+
+    def content_item(self, item_id):
+        j = self._j("GET", f"/content-items/{item_id}")
+        return j.get("contentItem") if isinstance(j, dict) else None
+
+    def set_favorite(self, item_id, is_favorited):
+        j = self._j("POST", f"/content-items/{item_id}/favorite", json={"isFavorited": is_favorited})
+        return j if isinstance(j, dict) else {}
+
+    def delete_content_item(self, item_id):
+        return self._j("DELETE", f"/content-items/{item_id}")
+
+    def bulk_delete_items(self, item_ids):
+        return self._j("DELETE", "/content-items/bulk-delete", json={"contentItemIds": item_ids})
+
+    # ── downloads ──
+    def download(self, url, out=None, media_dir=None):
+        if not out:
+            base = os.path.basename(url.split("?")[0]) or "download.bin"
+            media_dir = media_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
+            out = os.path.join(media_dir, base)
+            n = 1
+            while os.path.exists(out):
+                root, ext = os.path.splitext(base)
+                out = os.path.join(media_dir, f"{root}-{n}{ext}")
+                n += 1
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        last_exc = None
+        for attempt in range(3):
+            try:
+                with thread_session(self) as s:
+                    r = s.get(url, stream=True, timeout=180)
+                    r.raise_for_status()
+                    with open(out, "wb") as f:
+                        for chunk in r.iter_content(65536):
+                            f.write(chunk)
+                if os.path.getsize(out) == 0:
+                    raise VibesError(f"download {url[:60]}: empty file")
+                return out
+            except Exception as e:
+                last_exc = e
+                try:
+                    os.remove(out)
+                except Exception:
+                    pass
+                time.sleep(1.0 * (attempt + 1))
+        raise VibesError(f"download {url[:80]}: failed after 3 tries ({last_exc})")
+
+    # ── meta-graphql proxy (profile, ingredients library, social graph) ──
+    def meta_graphql(self, doc_id, variables=None):
+        return self._j("POST", "/meta-graphql",
+                       json={"doc_id": doc_id, "variables": variables or {}})
+
+    # ── analytics / consent / reports (the web app fires these; harmless) ──
+    def analytics(self, events, timestamp=None):
+        return self._j("POST", "/analytics",
+                       json={"timestamp": timestamp or int(time.time() * 1000),
+                             "events": events})
+
+    def consent_record(self):
+        return self._j("POST", "/consent/record", json={})
+
+    def bug_report(self, misc, uploaded_file=None, report_source="web"):
+        """FormData report. misc: dict like {"bug": "..."}. uploaded_file: local path."""
+        from curl_cffi import CurlMime
+        m = CurlMime()
+        m.addpart("misc_info", data=json.dumps(misc))
+        m.addpart("has_complete_logs", data="false")
+        m.addpart("report_source", data=report_source)
+        if uploaded_file:
+            m.addpart("uploaded_file", data=open(uploaded_file, "rb").read(),
+                      content_type="application/octet-stream",
+                      filename=os.path.basename(uploaded_file))
+        try:
+            return self._mp("/bug-report", m, expect_json=True)
+        except Exception as e:
+            raise VibesError(f"bug-report failed: {e}")
+
+def path_media(fn):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "media", fn)
+
+_HARD_REJECT_HINTS = (
+    "could not be generated", "try a different prompt", "another prompt",
+    "couldn't be generated", "couldnt be generated",
+    "not allowed", "content policy", "policy", "political", "alcohol",
+    "adult content", "offensive", "violenc", "disturbing",
+)
+
+def _hard_reject(res, err):
+    """Does this GENERATION_FAILED look like a server policy/quality refusal
+    (prompt itself is bad) rather than a transient failure? If so, don't retry."""
+    text = " ".join(str(x) for x in (err.get("message"), res.get("message")) if x).lower()
+    for it in (res.get("items") or []):
+        e = it.get("error") if isinstance(it, dict) else None
+        if isinstance(e, dict):
+            text += " " + str(e.get("message", "")).lower()
+        elif isinstance(e, str):
+            text += " " + e.lower()
+    if not text:
+        return False
+    return any(h in text for h in _HARD_REJECT_HINTS)
+
+# ── helpers ──
+def fmt_iso(t):
+    try:
+        return t[:19].replace("T", " ")
+    except Exception:
+        return str(t)
+
+def build_config(**kw):
+    base = {"directGeneration": True, "promptModel": "gemini-2.5-flash", "aspectRatio": "9:16",
+            "imageModel": "midjen-base", "videoModel": "midjen-short", "resolution": "480p",
+            "batchVariation": True}
+    base.update(kw)
+    return base
+
+# ── REPL (merged) ──────────────────────────────────────────────
+"""vibes.ai — full-featured CLI client for everything the web app can do.
+Type a plain prompt to generate 1 video; it auto-downloads to vibes/media/.
+
+Commands:
+  session:      /login /logout /me /status /geo
+  projects:     /projects /use <id|index> /new /rename <name> /dup /delete /assets /export /content
+  generate:     type a prompt              → 1 video (auto project, auto download)
+                /img <prompt>              → 1 image/still (1:1)
+                /v <prompt>                → video w/ options:
+                     [n=<count>] [aspect=<9:16|1:1|16:9>] [res=<480p|720p|1080p>]
+                     [model=<midjen-short|midjen-long|midjen>]
+                /ref <file>                → set reference image (image-to-video)
+                /audio <file>              → upload audio (for lip-sync)
+                /lipsync <voiceId> <text>  → TTS lip-sync on current reference
+  media:        /media [video|images|audio] [type]
+                    /fav <itemId>            or /unfav
+                    /dl <url> [name]
+                    /del <itemId>  /delbatch <batchId>
+  studio:       /voices  /ing [LIBRARY|VIEWER]
+  system:       /bug-report  /report <issue>
+
+Examples:
+  > a red fox jumping in snow, cinematic          # auto t2v
+  > /img cyberpunk city                            # image generation
+  > /ref myphoto.jpg                               # set reference
+  > a car driving in the desert                    # i2v using reference
+  > /v a bird flying aspect=16:9 res=480p        # options
+"""
+import io, json, os, sys, time, concurrent.futures
+
+API_IMAGES_VIA_VIDEOS = True  # /generate/images 500s on this account; image-type batches
+                             # actually route through /generate/videos and yield mp4 clips
+
+import auth
+from client import Vibes, VibesError, fmt_iso
+
+C = None
+CUR = None        # current project dict
+OREF = None       # reference image dict {mediaEntId}; optional
+AUDIO = None      # {mediaEntId, ...} last audio upload
+
+def pid():
+    return CUR["id"] if CUR else None
+
+def project_list():
+    return C.list_projects()
+
+def project_create(name="Untitled"):
+    return C.create_project(name)
+
+def ensure():
+    global CUR
+    if CUR:
+        return True
+    p = C.create_project()
+    if p:
+        CUR = p
+        print(f"[+] auto-created project {p['id'][:8]}…")
+        return True
+    print("[!] could not create project")
+    return False
+
+def _pick(projects, arg):
+    if not arg:
+        return None
+    if arg.isdigit() and int(arg) < len(projects):
+        return projects[int(arg)]
+    for p in projects:
+        if p["id"] == arg or (arg in (p.get("name") or "")):
+            return p
+    return None
+
+def download_all(items, kind="videos"):
+    only_video = kind == "videos"
+    got = []
+    for it in items:
+        if it.get("error"):
+            print(f"    [x] item failed: {str(it['error'])[:70]}")
+        if only_video and it.get("videoUrl"):
+            got.append(it["videoUrl"])
+        elif not only_video and (it.get("videoUrl") or it.get("imageUrl")):
+            got.append(it.get("videoUrl") or it.get("imageUrl"))
+    if not got:
+        print("    (nothing to download yet)")
+        return []
+    paths = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(got))) as ex:
+        futs = {ex.submit(C.download, u): u for u in got}
+        for f in concurrent.futures.as_completed(futs):
+            try:
+                p = f.result()
+                sz = os.path.getsize(p) / 1048576
+                print(f"    [+] {os.path.basename(p)[:46]}  {sz:.1f} MB")
+                paths.append(p)
+            except Exception as e:
+                print(f"    [x] download failed: {e}")
+    print(f"[*] saved {len(got)} file(s) in vibes/media/")
+    return paths
+
+def gen(prompt, n=1, aspect="9:16", resolution="480p", kind="videos", model=None, extra=None):
+    if not ensure():
+        return
+    t0 = time.time()
+    print(f"[*] {kind} · {prompt[:90]}")
+    try:
+        items, bid = C.generate(CUR, prompt, n=n, aspect=aspect, resolution=resolution,
+                                kind=kind, model=model, oref=OREF, extra=extra,
+                                generation_type="t2v")
+    except VibesError as e:
+        print(f"[!] {e}")
+        return
+    if not items:
+        print("[!] no result — try another prompt")
+        return
+    n_ok = sum(1 for it in items if not it.get("error"))
+    print(f"[*] {n_ok}/{len(items)} finished in {time.time()-t0:.0f}s")
+    download_all(items, kind=kind)
+
+def set_ref(path):
+    global OREF
+    if not os.path.exists(path):
+        print("[!] file not found:", path)
+        return False
+    if not ensure():
+        return False
+    j = C.upload_media(path)
+    items = C.project_upload(pid(), j)
+    if items:
+        OREF = {"mediaEntId": j["mediaEntId"], "cdnUrl": j.get("cdnUrl"),
+                "_id": items[0]["id"]}
+        print(f"[+] reference set ({os.path.basename(path)}) → type videos now")
+        return True
+    print("[!] upload failed")
+    return False
+
+def dispatch(op, arg):
+    global CUR, OREF, AUDIO, C
+    v = C
+    if op == "/login":
+        s = auth.login_session()
+        if s is None:
+            return
+        auth.save_session(s)
+        C = Vibes(s)
+        try:
+            u = C.me()
+            print(f"[+] logged in as {u['username']} ({u['id'][:8]}…)")
+        except VibesError as e:
+            print("[!]", e)
+    elif op == "/logout":
+        auth.clear_session()
+        print("[.] session cleared")
+    elif op == "/me":
+        u = v.me()
+        print(json.dumps({k: u.get(k) for k in ("id", "username", "abraUserId", "accountStatus")}, indent=2))
+        kp = u.get("kadabraProfile") or {}
+        print(f"    kadabra: {kp.get('kadabraProfileUsername')} id={kp.get('kadabraProfileId')}")
+    elif op == "/status":
+        print(json.dumps(v.system_status())[:200])
+    elif op == "/geo":
+        print(json.dumps(v.geo())[:200])
+    elif op == "/new":
+        if arg:
+            p = v.create_project(name=arg)
+            if p:
+                CUR = p
+                print(f"[+] current project: {p.get('id')}  {p.get('name')}")
+        else:
+            p = v.create_project()
+            if p:
+                CUR = p
+                print(f"[+] current project: {p.get('id')}  {p.get('name')}")
+    elif op in ("/projects", "/list"):
+        for i, p in enumerate(v.list_projects()):
+            print(f"  [{i}] {p['id']}  {p.get('name')}  thumb={bool(p.get('thumbnailUrl'))}")
+    elif op == "/use":
+        projects = v.list_projects()
+        if not arg:
+            for i, p in enumerate(projects):
+                print(f"  [{i}] {p['id']}  {p.get('name')}  {fmt_iso(p.get('createdAt'))}")
+            return
+        p = _pick(projects, arg)
+        if p:
+            CUR = p
+            print(f"[+] current project: {p.get('id')}  {p.get('name')}")
+        else:
+            print("[!] project not found")
+    elif op == "/rename":
+        parts = arg.split(None, 1)
+        if not parts:
+            print("[!] usage: /rename <id|idx> <newname>")
+            return
+        p = _pick(v.list_projects(), parts[0])
+        if not p:
+            print("[!] project not found:", parts[0])
+            return
+        name = parts[1] if len(parts) > 1 else p.get("name")
+        np = v.rename_project(p["id"], name)
+        if np:
+            CUR = np
+            print(f"[+] renamed → {np.get('name')}")
+        else:
+            print("[!] rename rejected by server")
+    elif op == "/dup":
+        if not CUR:
+            print("[!] no current project")
+            return
+        p = v.duplicate_project(CUR["id"])
+        if p:
+            print(f"[+] duplicated → {p.get('id')}  {p.get('name')}")
+    elif op == "/delete":
+        if not CUR:
+            print("[!] no current project; select with /use")
+            return
+        v.delete_project(CUR["id"])
+        print(f"[+] deleted {CUR['id']}")
+        CUR = None
+    elif op == "/assets":
+        if not CUR:
+            print("[!] no current project")
+            return
+        for a in v.project_assets(pid()):
+            print(f"  {a.get('contentItemId','')[:26]:26s} [{a.get('relationship')}] "
+                  f"{a.get('type')}  vid={bool(a.get('videoUrl'))}")
+    elif op == "/export":
+        if not CUR:
+            print("[!] no current project")
+            return
+        print("pending export:", v.project_timeline_export_pending(pid()))
+    elif op == "/content":
+        items = v.content_items(limit=40)
+        print(f"{len(items)} content items")
+        for it in items:
+            fl = "♥" if it.get("isFavorited") else "·"
+            lip = " lipsync" if it.get("isLipsync") else ""
+            print(f"  {fl} {it.get('type',''):6s} {str(it.get('id',''))[:26]:26} {lip}")
+    elif op == "/media":
+        args = arg.split()
+        types_ = None
+        for a in args:
+            if a.lower() in ("video", "images", "audio", "gallery", "media"):
+                types_ = (types_ + "," if types_ else "") + a.lower()
+        types_ = types_ or "video,images,audio"
+        items, _ = v.media_library(types=types_, limit=50)
+        print(f"media library ({types_}) · {len(items)}")
+        for it in items:
+            url = it.get("fullUrl") or it.get("thumbnailUrl") or ""
+            fav = "♥" if it.get("isFavorited") else "·"
+            print(f"  {fav} {str(it.get('id',''))[:26]:24} "
+                  f"{str(it.get('type',''))[:8]:8} {url.split('?')[0][:50]}")
+    elif op == "/fav":
+        if not arg:
+            print("[!] usage: /fav <itemId>")
+            return
+        print(v.set_favorite(arg, True))
+    elif op == "/unfav":
+        if not arg:
+            print("[!] usage: /unfav <itemId>")
+            return
+        print(v.set_favorite(arg, False))
+    elif op == "/del":
+        if not arg:
+            print("[!] usage: /del <itemId>")
+            return
+        print(v.delete_content_item(arg))
+    elif op == "/delbatch":
+        if not arg:
+            print("[!] usage: /delbatch <batchId>")
+            return
+        print(v.delete_batch(arg))
+    elif op == "/voices":
+        for vo in v.studio_voices():
+            print(f"  {vo['id'].ljust(30)} {vo.get('name','')[:18]:16} {vo.get('description','')[:42]}")
+    elif op == "/ing":
+        owner = "LIBRARY"
+        if arg:
+            owner = arg.upper()
+        ing, info = v.studio_ingredients(owner)
+        print(f"ingredients [{owner}]")
+        for it in ing[:40]:
+            print(f"  {it.get('ingredientType','?')[:9]:9s} {it.get('name','')[:40]:40}  {it.get('ingredientId')}")
+        if info and info.get("hasNextPage"):
+            print("  …more (endCursor)", info.get("endCursor"))
+    elif op == "/dl":
+        parts = arg.split(None, 1)
+        if not parts or not parts[0]:
+            print("[!] usage: /dl <url> [filename]")
+            return
+        out = None
+        if len(parts) > 1:
+            out = os.path.join(HERE, "media", parts[1])
+        p = v.download(parts[0], out=out)
+        print("[+] saved", p)
+    elif op == "/ref":
+        if not arg:
+            print("[!] usage: /ref <imagefile>")
+            return
+        if not ensure():
+            return
+        set_ref(arg)
+    elif op == "/aud":
+        if not arg:
+            print("[!] usage: /au <audiofile>")
+            return
+        global AUDIO
+        j = C.upload_audio_direct(arg)
+        AUDIO = {"mediaEntId": j["mediaEntId"], "cdnUrl": j.get("cdnUrl")}
+        print(f"[+] audio ready {AUDIO['mediaEntId']}")
+    elif op == "/lipsync":
+        if not arg:
+            print("[!] usage: /lipsync <prompt> (needs /ref or /au set)")
+            return
+        if not ensure():
+            return
+        bid = C.make_batch(CUR, arg, n=1, aspect="9:16", oref=OREF)
+        extra = {}
+        if OREF:
+            extra["sourceContentItemIds"] = [{"id": OREF["_id"], "source": "image"}]
+        if AUDIO:
+            extra["audioMediaEntId"] = AUDIO["mediaEntId"]
+        res = C.generate_videos(CUR, arg, bid, n=1, oref=OREF, extra=extra)
+        if isinstance(res, dict) and res.get("success"):
+            print("[*] queued (lipsync)")
+        else:
+            print("[!] lipsync failed", res)
+    elif op == "/img":
+        if not arg:
+            print("[!] usage: /img <prompt>")
+            return
+        gen(arg, kind="images", n=1, aspect="1:1")
+    elif op == "/v":
+        if not arg:
+            print("[!] usage: /v <prompt> [n <n>] [aspect <ratio>] [res <x>] [model <x>]")
+            return
+        tokens = arg.split()
+        prompt = []
+        n = 1
+        aspect = "9:16"
+        res = "480p"
+        model = None
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            m = None
+            for key, name in (("n", "n"), ("count", "n"), ("aspect", "aspect"),
+                              ("res", "res"), ("resolution", "res"), ("model", "model")):
+                if t.startswith(key + "="):
+                    m = (name, t[len(key) + 1:], 1)
+                    break
+                if t == key:
+                    m = (name, None, 2)
+                    break
+            if m:
+                name, val, step = m
+                if val is None:
+                    if i + 1 >= len(tokens):
+                        print(f"[!] missing value for {key}")
+                        return
+                    val = tokens[i + 1]
+                if name == "n":
+                    n = max(1, min(40, int(val)))
+                elif name == "aspect":
+                    aspect = val
+                elif name == "res":
+                    res = val
+                else:
+                    model = val
+                i += step
+                continue
+            prompt.append(t)
+            i += 1
+        gen(" ".join(prompt), n=n, aspect=aspect, resolution=res, model=model)
+    elif op == "/exportall":
+        pass
+    elif op == "/help":
+        print(__doc__.split("Commands:")[0].strip() if False else __doc__)
+    elif op == "/quit":
+        print("bye")
+        sys.exit(0)
+    else:
+        print(f"[?] unknown command {op}; /help for the list")
+
+def repl():
+    global C
+    s = auth.load_session()
+    if s:
+        C = Vibes(s)
+        try:
+            u = C.me()
+            print(f"[+] session: {u['username']}")
+        except (VibesError, Exception):
+            print("[!] saved session invalid — /login")
+            C = None
+    else:
+        print("[*] no saved session — /login")
+    print("> type a prompt → generate videos (auto-save to vibes/media/)")
+    print("> /help  /projects  /media  /voices  /img  /v  /ref /  /upload  /dl  /dup…")
+    while True:
+        try:
+            raw = input("vibes> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nbye")
+            break
+        if not raw:
+            continue
+        if raw.startswith("/"):
+            parts = raw.split(None, 1)
+            op, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
+        else:
+            op, arg = raw, ""          # plain text = prompt → video
+        if op not in ("/login", "/quit", "/help") and C is None:
+            print("[!] /login first")
+            continue
+        try:
+            if op.startswith("/"):
+                dispatch(op, arg)
+            else:
+                gen(raw)
+        except VibesError as e:
+            print("[!]", e)
+        except Exception as e:
+            print("[!]", type(e).__name__, e)
+
+
+if __name__ == "__main__":
+    # fix Windows stdout encoding (only when actually running the REPL)
+    if not (getattr(sys.stdout, "encoding", None) or "").lower().startswith("utf"):
+        try:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    repl()

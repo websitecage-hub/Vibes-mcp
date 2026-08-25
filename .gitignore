@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+_rt/
+session.json
+meta_session.json
+token.txt
+media/
+downloads/
+.vibe/
+.env

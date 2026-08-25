@@ -1,0 +1,9 @@
+fastapi>=0.115
+uvicorn>=0.32
+mcp[cli]>=1.10,<2
+curl_cffi>=0.7
+websockets>=13.0
+protobuf>=4.25,<5
+pynacl>=1.5
+cryptography>=43.0
+requests>=2.32
