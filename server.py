@@ -108,12 +108,12 @@ def _media_response(header, urls, note=""):
 
 
 async def meta_ask(message, mode="instant", timeout=240, attachments=None,
-                   attempts=2):
-    """Full-capability meta.ai passthrough. Returns dict(text, media[])."""
+                   attempts=2, conversation_id=None):
+    """Full-capability meta.ai passthrough. Reuses conversation_id for context."""
     token = meta_client.load_token()
     if not token:
         raise RuntimeError("no META_TOKEN available")
-    conv = str(uuid.uuid4())
+    conv = conversation_id or str(uuid.uuid4())
     last_err = None
     for attempt in range(attempts):
         sess = meta_client.DGWSession(token, conv, download_media=False)
@@ -310,7 +310,10 @@ def _run_vibe_gen(prompt, aspect, resolution, model, n, max_sec,
     v = _get_vibes()
     tmp = None
     try:
-        project = _ensure_project(v)
+        if hub_project_id and _get_hub_project(hub_project_id):
+            project = _ensure_hub_vibes_project(hub_project_id, v)
+        else:
+            project = _ensure_project(v)
         oref = None
         gen_type = gen_kind if gen_kind in ("t2v", "i2v") else "t2v"
         if reference_image_url:
@@ -334,6 +337,11 @@ def _run_vibe_gen(prompt, aspect, resolution, model, n, max_sec,
             except OSError:
                 pass
     results = _pick_urls(items, "video")
+    if hub_project_id:
+        with PROJECTS_LOCK:
+            hub = PROJECTS.get(hub_project_id)
+            if hub is not None:
+                hub["history"].append({"prompt": prompt, "items": results, "at": __import__("time").time()})
     if not results:
         raise RuntimeError("vibes returned no usable items")
     return {"batch_id": batch_id, "items": results}
@@ -372,6 +380,11 @@ def vibes_lipsync(source_url, audio_url, prompt="", aspect="9:16",
                 except OSError:
                     pass
     results = _pick_urls(items, "video")
+    if hub_project_id:
+        with PROJECTS_LOCK:
+            hub = PROJECTS.get(hub_project_id)
+            if hub is not None:
+                hub["history"].append({"prompt": prompt, "items": results, "at": __import__("time").time()})
     if not results:
         raise RuntimeError("lipsync produced no usable items")
     return {"items": results}
@@ -469,9 +482,61 @@ async def _janitor_loop():
                          if now - v["created"] > 3600]
                 for k in stale:
                     JOBS.pop(k, None)
+            with PROJECTS_LOCK:
+                for pr in PROJECTS.values():
+                    if len(pr.get("history", [])) > 80:
+                        pr["history"] = pr["history"][-50:]
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(3600)
+
+# ── hub projects (persistent context per Image/Video/Animate) ────────────
+
+PROJECTS: dict = {}
+PROJECTS_LOCK = __import__("threading").Lock()
+
+
+def _hub_projects(kind=None):
+    with PROJECTS_LOCK:
+        vals = list(PROJECTS.values())
+    if kind:
+        vals = [pr for pr in vals if pr["kind"] == kind]
+    vals.sort(key=lambda x: x["created"], reverse=True)
+    return vals
+
+
+def _get_hub_project(pid):
+    with PROJECTS_LOCK:
+        return PROJECTS.get(pid)
+
+
+def _create_hub_project(kind, name):
+    import uuid as _uuid
+    pid = _uuid.uuid4().hex[:10]
+    rec = {"id": pid, "kind": kind, "name": name.strip() or f"{kind.title()} {pid[:4]}",
+           "conversation_id": __import__("uuid").uuid4().hex, "vibes_project_id": None,
+           "history": [], "created": __import__("time").time()}
+    with PROJECTS_LOCK:
+        PROJECTS[pid] = rec
+    return rec
+
+
+def _ensure_hub_vibes_project(hub_pid, vibes_client):
+    hub = _get_hub_project(hub_pid)
+    if hub is None:
+        return _ensure_project(vibes_client)
+    if hub.get("vibes_project_id"):
+        try:
+            pr = vibes_client.get_project(hub["vibes_project_id"])
+            if pr:
+                return pr
+        except Exception:
+            pass
+    pr = _ensure_project(vibes_client)
+    with PROJECTS_LOCK:
+        if hub["id"] in PROJECTS:
+            PROJECTS[hub["id"]]["vibes_project_id"] = pr["id"]
+    return pr
 
 # ── async job system (dispatch + poll) ────────────────────────────────────
 
@@ -514,7 +579,7 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def generate_image(prompt: str) -> list:
+async def generate_image(prompt: str, project_id: str = "") -> list:
     """CREATE a brand-new IMAGE from a TEXT description using Meta AI.
     ALWAYS use this when the user wants to create/make/generate/draw a
     picture, photo, artwork, logo, poster, sticker or any visual — it works
@@ -527,7 +592,12 @@ async def generate_image(prompt: str) -> list:
             sunglasses on a beach at sunset, photorealistic'.
     """
     try:
-        res = await meta_ask("/imagine " + prompt, timeout=180)
+        hub = _get_hub_project(project_id) if project_id else None
+        cid = hub["conversation_id"] if hub else None
+        res = await meta_ask("/imagine " + prompt, timeout=180, conversation_id=cid)
+        if hub:
+            with PROJECTS_LOCK:
+                hub["history"].append({"prompt": prompt, "urls": [m["url"] for m in res["media"] if m.get("url")], "at": __import__("time").time()})
     except Exception as e:  # noqa: BLE001
         return [TextContent(type="text", text=f"ERROR: {e}")]
     urls = [m["url"] for m in res["media"] if m.get("url")]
@@ -605,7 +675,8 @@ async def make_gif(prompt: str) -> list:
 @mcp.tool()
 async def generate_video(prompt: str, aspect_ratio: str = "9:16",
                          resolution: str = "480p", model: str = "",
-                         count: int = 1, reference_image_url: str = "") -> str:
+                         count: int = 1, reference_image_url: str = "",
+                         project_id: str = "") -> str:
     """CREATE a brand-new VIDEO from a TEXT description (no image needed).
     Use this whenever the user wants a new video made from scratch.
     For an ad/clip/scene: just describe it. Animating an existing photo?
@@ -622,11 +693,12 @@ async def generate_video(prompt: str, aspect_ratio: str = "9:16",
         count: How many variations (1-4).
         reference_image_url: Optional. Public URL of an image to animate
             (image-to-video). Leave empty for pure text-to-video.
+        project_id: Optional hub project id to keep videos in one series.
     """
     jid = _start_job("video", _vibes_with_fresh_login, _run_vibe_gen, prompt,
                      aspect_ratio, resolution, model or None,
                      max(1, min(4, count)), 420,
-                     reference_image_url or None, "t2v")
+                     reference_image_url or None, "t2v", project_id or None)
     return (f"Video generation STARTED.\njob_id: {jid}\n"
             f"NEXT STEP: call check_generation(\"{jid}\") — wait ~20 seconds "
             f"between calls until status is \"done\" (typically 60-240s).")
@@ -635,7 +707,8 @@ async def generate_video(prompt: str, aspect_ratio: str = "9:16",
 @mcp.tool()
 async def animate_image(image_url: str, prompt: str = "",
                         aspect_ratio: str = "9:16",
-                        resolution: str = "480p") -> str:
+                        resolution: str = "480p",
+                        project_id: str = "") -> str:
     """Turn an EXISTING image into a short video (image-to-video).
 
     ASYNC: returns a job_id IMMEDIATELY. Then call check_generation(job_id)
@@ -649,7 +722,8 @@ async def animate_image(image_url: str, prompt: str = "",
     """
     jid = _start_job("animate", _vibes_with_fresh_login, _run_vibe_gen,
                      prompt or "animate this image", aspect_ratio,
-                     resolution, None, 1, 420, image_url, "i2v")
+                     resolution, None, 1, 420, image_url, "i2v",
+                     project_id or None)
     return (f"Image animation STARTED.\njob_id: {jid}\n"
             f"NEXT STEP: call check_generation(\"{jid}\") — wait ~20 seconds "
             f"between calls until status is \"done\".")
@@ -958,10 +1032,16 @@ async def api_image(req: Request):
     try:
         body = await req.json()
         prompt = str(body.get("prompt", "")).strip()
+        project_id = str(body.get("project_id") or "").strip() or None
         if not prompt:
             return JSONResponse({"error": "prompt required"}, status_code=400)
-        res = await meta_ask("/imagine " + prompt, timeout=180)
+        hub = _get_hub_project(project_id) if project_id else None
+        cid = hub["conversation_id"] if hub else None
+        res = await meta_ask("/imagine " + prompt, timeout=180, conversation_id=cid)
         urls = [m["url"] for m in res["media"] if m.get("url")]
+        if hub:
+            with PROJECTS_LOCK:
+                hub["history"].append({"prompt": prompt, "urls": urls, "text": res.get("text","")[:300], "at": __import__("time").time()})
         if not urls:
             msg = (res.get("text") or "").strip() or "No image returned — try rephrasing the prompt."
             return JSONResponse({"urls": [], "error": msg[:600]})
@@ -977,11 +1057,14 @@ async def api_video(req: Request):
         prompt = str(body.get("prompt", "")).strip()
         if not prompt:
             return JSONResponse({"error": "prompt required"}, status_code=400)
+        project_id = str(body.get("project_id") or "").strip() or None
         jid = _start_job("video", _run_vibe_gen, prompt,
                          body.get("aspect_ratio", "9:16"),
-                         body.get("resolution", "480p"), None,
+                         body.get("resolution", "480p"),
+                         body.get("model") or None,
                          int(body.get("count", 1)), 420,
-                         body.get("reference_image_url") or None, "t2v")
+                         body.get("reference_image_url") or None, "t2v",
+                         project_id)
         return JSONResponse({"job_id": jid})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"error": str(e)[:300]}, status_code=500)
@@ -1036,116 +1119,182 @@ async def api_download(url: str):
         headers={"Content-Disposition": f'attachment; filename="{base}"',
                  "Content-Length": str(len(r.content))})
 
+@app.get("/api/projects")
+async def api_list_projects(kind: str = ""):
+    kind = (kind or "").lower()
+    if kind not in ("image", "video", "animate"):
+        kind = None
+    return JSONResponse({"projects": _hub_projects(kind)})
+
+
+@app.post("/api/projects")
+async def api_create_project(req: __import__("fastapi").Request):
+    body = await req.json()
+    kind = str(body.get("kind", "image")).lower()
+    if kind not in ("image", "video", "animate"):
+        kind = "image"
+    name = str(body.get("name", "")).strip()
+    return JSONResponse(_create_hub_project(kind, name))
+
+
 # ── web app ───────────────────────────────────────────────────────────────
 
 _APP_HTML = """<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Media Gen Studio</title>
+<title>Media Gen Studio — Production Hub</title>
 <style>
-  :root{--bg:#0a0a0a;--card:#111214;--border:#262626;--txt:#ededed;--dim:#8f8f8f;--accent:#0070f3}
+  :root{--bg:#0a0a0a;--card:#111214;--border:#262626;--txt:#ededed;--dim:#8f8f8f;--accent:#0070f3;--r:14px}
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--txt);font-family:Inter,-apple-system,'Segoe UI',Roboto,sans-serif;
-       min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px}
-  .wrap{width:100%;max-width:760px}
-  h1{font-size:28px;font-weight:600;letter-spacing:-.5px}
-  .sub{color:var(--dim);font-size:14px;margin-top:6px}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:24px;margin-top:28px}
+  body{background:var(--bg);color:var(--txt);font-family:Inter,-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:36px 16px}
+  .wrap{width:100%;max-width:820px}
+  h1{font-size:26px;font-weight:600;letter-spacing:-.5px} .sub{color:var(--dim);font-size:13px;margin-top:4px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:22px;margin-top:22px}
   .tabs{display:flex;gap:4px;background:#161618;border-radius:10px;padding:4px;width:fit-content}
   .tab{padding:7px 18px;border-radius:8px;font-size:13.5px;color:var(--dim);cursor:pointer;border:none;background:none}
   .tab.on{background:#2c2c2e;color:#fff}
-  textarea{width:100%;background:#0d0d0e;border:1px solid var(--border);border-radius:10px;color:var(--txt);
-           padding:14px;font-size:14.5px;resize:vertical;min-height:96px;margin-top:18px;font-family:inherit}
+  .projbar{display:flex;gap:8px;align-items:center;margin-top:14px;flex-wrap:wrap}
+  .projbar label{font-size:12px;color:var(--dim)} .projbar select{min-width:180px}
+  .projbar button{background:#1f1f21;border:1px solid var(--border);color:var(--txt);border-radius:8px;padding:7px 12px;font-size:12.5px;cursor:pointer}
+  .projbar button:hover{background:#252529}
+  textarea{width:100%;background:#0d0d0e;border:1px solid var(--border);border-radius:10px;color:var(--txt);padding:13px;font-size:14px;resize:vertical;min-height:88px;margin-top:14px;font-family:inherit}
   textarea:focus{outline:none;border-color:var(--accent)}
-  .opts{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
-  select{background:#0d0d0e;border:1px solid var(--border);color:var(--txt);border-radius:8px;padding:9px 12px;font-size:13px}
-  button.go{margin-top:16px;background:#fff;color:#000;border:none;border-radius:10px;padding:11px 26px;
-            font-size:14px;font-weight:600;cursor:pointer;transition:.15s}
+  .opts{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  select,input.url{background:#0d0d0e;border:1px solid var(--border);color:var(--txt);border-radius:8px;padding:8px 10px;font-size:12.5px}
+  input.url{width:100%;margin-top:10px}
+  button.go{margin-top:14px;background:#fff;color:#000;border:none;border-radius:10px;padding:11px 26px;font-size:14px;font-weight:600;cursor:pointer}
   button.go:hover{background:#e5e5e5}button.go:disabled{opacity:.45;cursor:wait}
-  input.url{width:100%;background:#0d0d0e;border:1px solid var(--border);border-radius:10px;color:var(--txt);
-            padding:11px 13px;font-size:13.5px;margin-top:12px}
-  #msg{margin-top:14px;font-size:13.5px;color:var(--dim);min-height:20px}
+  #msg{margin-top:12px;font-size:13px;color:var(--dim);min-height:18px;white-space:pre-wrap}
   #msg.err{color:#f87171}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-top:22px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;margin-top:18px}
   .grid img,.grid video{width:100%;border-radius:12px;border:1px solid var(--border);display:block;background:#000}
   a.dl{font-size:12px;color:var(--accent);text-decoration:none;display:inline-block;margin-top:6px}
-  footer{margin-top:auto;padding-top:60px;color:#555;font-size:12px;text-align:center}
+  .hist{margin-top:18px;border-top:1px solid var(--border);padding-top:14px}
+  .hist h3{font-size:12px;color:var(--dim);letter-spacing:.4px;text-transform:uppercase;margin-bottom:8px}
+  .hgrid{display:flex;gap:8px;overflow-x:auto;padding-bottom:6px}
+  .hgrid img,.hgrid video{height:72px;width:auto;border-radius:8px;border:1px solid var(--border)}
+  footer{margin-top:auto;padding-top:50px;color:#555;font-size:12px;text-align:center}
 </style></head><body>
 <div class="wrap">
-  <h1>Media Gen Studio</h1>
-  <div class="sub">Images by Meta AI &middot; Videos by Vibes AI</div>
+  <h1>Media Gen Studio — Production Hub</h1>
+  <div class="sub">Persistent projects with context · Images by Meta AI · Videos by Vibes AI · <a href="/health" style="color:var(--dim)">health</a></div>
   <div class="card">
     <div class="tabs">
       <button class="tab on" data-m="image">Image</button>
       <button class="tab" data-m="video">Video</button>
       <button class="tab" data-m="animate">Animate image</button>
     </div>
-    <textarea id="prompt" placeholder="Describe what you want to create..."></textarea>
+    <div class="projbar" id="projbar">
+      <label>Project:</label>
+      <select id="proj"></select>
+      <button id="newproj">+ New project</button>
+      <span id="projinfo" style="font-size:12px;color:var(--dim)"></span>
+    </div>
+    <textarea id="prompt" placeholder="Describe what you want — style stays consistent inside one project..."></textarea>
     <input class="url" id="refurl" placeholder="https://image-url-to-animate.jpg" style="display:none">
     <div class="opts">
-      <select id="aspect">
-        <option value="1:1">1:1 square</option><option value="9:16">9:16 vertical</option>
-        <option value="16:9">16:9 wide</option><option value="4:5">4:5 post</option>
-      </select>
-      <select id="res">
-        <option value="480p">480p fast</option><option value="720p">720p</option>
-        <option value="1080p">1080p slow</option>
-      </select>
+      <select id="aspect"><option value="1:1">1:1 square</option><option value="9:16">9:16 vertical</option><option value="16:9">16:9 wide</option><option value="4:5">4:5 post</option><option value="3:4">3:4</option></select>
+      <select id="res"><option value="480p">480p fast</option><option value="720p">720p</option><option value="1080p">1080p slow</option></select>
+      <select id="model"><option value="">auto model</option><option value="midjen-short">midjen-short</option><option value="midjen-long">midjen-long</option><option value="midjen">midjen</option><option value="sora">sora</option><option value="veo">veo</option></select>
+      <select id="count"><option value="1">×1</option><option value="2">×2</option><option value="3">×3</option><option value="4">×4</option></select>
     </div>
     <button class="go" id="go">Generate</button>
     <div id="msg"></div>
     <div class="grid" id="grid"></div>
+    <div class="hist" id="hist" style="display:none"><h3>Project history</h3><div class="hgrid" id="hgrid"></div></div>
   </div>
 </div>
-<footer>media-gen-mcp &middot; free tier &middot; videos take 1-5 min</footer>
+<footer>media-gen-mcp · free tier · videos 1-5 min · context stays inside each project</footer>
 <script>
 let MODE='image';
+let ACTIVE={image:null,video:null,animate:null};
+let PROJECTS={image:[],video:[],animate:[]};
+const $=id=>document.getElementById(id);
+function addMedia(u,type){
+  const d=document.createElement('div');
+  if(type==='video'||/\.mp4($|\?)/.test(u)) d.innerHTML=`<video src="${u}" controls muted playsinline></video><a class="dl" href="/api/download?url=${encodeURIComponent(u)}" download>Download</a>`;
+  else d.innerHTML=`<img src="${u}"><a class="dl" href="/api/download?url=${encodeURIComponent(u)}" download>Download</a>`;
+  $('grid').prepend(d);
+}
+function histThumb(u){return /\.mp4/.test(u)?`<video src="${u}" muted></video>`:`<img src="${u}">`;}
+async function loadProjects(){
+  for(const k of ['image','video','animate']){
+    const r=await fetch('/api/projects?kind='+k); const j=await r.json();
+    PROJECTS[k]=j.projects||[];
+    if(!ACTIVE[k] && j.projects.length) ACTIVE[k]=j.projects[0].id;
+    if(!j.projects.length){
+      const c=await fetch('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:k,name:k.charAt(0).toUpperCase()+k.slice(1)+' #1'})}).then(r=>r.json());
+      PROJECTS[k]=[c]; ACTIVE[k]=c.id;
+    }
+  }
+  renderProjBar();
+}
+function renderProjBar(){
+  const list=PROJECTS[MODE]||[];
+  $('proj').innerHTML=list.map(p=>`<option value="${p.id}" ${p.id===ACTIVE[MODE]?'selected':''}>${p.name}</option>`).join('');
+  const cur=list.find(p=>p.id===ACTIVE[MODE]);
+  $('projinfo').textContent=cur?`${(cur.history||[]).length} items · ${cur.id.slice(0,6)}`:'';
+  const h=$('hgrid'); h.innerHTML='';
+  const hist=(cur&&cur.history)||[];
+  if(hist.length){$('hist').style.display='block';
+    [...hist].reverse().slice(0,16).forEach(e=>{
+      const urls=e.urls|| (e.items||[]).map(x=>x.url);
+      urls.forEach(u=>{const a=document.createElement('a');a.href=u;a.target='_blank';a.innerHTML=histThumb(u);h.appendChild(a);});
+    });
+  } else $('hist').style.display='none';
+  $('refurl').style.display=MODE==='animate'?'block':'none';
+}
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
-  t.classList.add('on');MODE=t.dataset.m;
-  document.getElementById('refurl').style.display=MODE==='animate'?'block':'none';
-  document.getElementById('res').style.display=MODE==='image'?'none':'block';
+  t.classList.add('on'); MODE=t.dataset.m;
+  $('grid').innerHTML='';
+  renderProjBar();
 });
-const $=id=>document.getElementById(id);
-function addImg(u){const d=document.createElement('div');
-  d.innerHTML=`<img src="${u}"><a class="dl" href="/api/download?url=${encodeURIComponent(u)}" download>Download</a>`;
-  $('grid').prepend(d);}
-function addVid(u){const d=document.createElement('div');
-  d.innerHTML=`<video src="${u}" controls muted playsinline></video><a class="dl" href="/api/download?url=${encodeURIComponent(u)}" download>Download</a>`;
-  $('grid').prepend(d);}
-async function poll(jid){const r=await fetch('/api/job/'+jid);
-  const j=await r.json();
-  if(j.status==='running'){$('msg').textContent=`Generating... ${j.elapsed_s}s`;setTimeout(()=>poll(jid),8000);return;}
+$('proj').onchange=e=>{ACTIVE[MODE]=e.target.value;$('grid').innerHTML='';renderProjBar();};
+$('newproj').onclick=async()=>{
+  const name=prompt('Project name:',''); if(name===null) return;
+  const r=await fetch('/api/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:MODE,name:name||''})});
+  const p=await r.json(); PROJECTS[MODE].unshift(p); ACTIVE[MODE]=p.id; $('grid').innerHTML=''; renderProjBar();
+};
+async function poll(jid){
+  const r=await fetch('/api/job/'+jid); const j=await r.json();
+  if(j.status==='running'){$('msg').textContent=`Generating... ${j.elapsed_s}s`; setTimeout(()=>poll(jid),8000); return;}
   $('go').disabled=false;
   if(j.status==='error'||j.error){$('msg').textContent=j.error||'failed';$('msg').className='err';return;}
   $('msg').textContent='Done!';
   (j.items||[]).forEach(it=>{
     if(it.error){$('msg').textContent='Item failed: '+it.error;return;}
-    const u=it.url||it.videoUrl||it.imageUrl;if(!u)return;
-    if(it.type==='video'||/\.mp4($|\?)/.test(u)||/video\//.test(u))addVid(u);else addImg(u);
+    const u=it.url||it.videoUrl||it.imageUrl; if(!u) return;
+    addMedia(u,it.type||'video');
   });
+  const pr=await fetch('/api/projects?kind='+MODE).then(r=>r.json());
+  PROJECTS[MODE]=pr.projects; renderProjBar();
 }
 $('go').onclick=async()=>{
-  const p=$('prompt').value.trim();if(!p)return;
-  $('go').disabled=true;$('msg').className='';$('msg').textContent='Starting...';
+  const p=$('prompt').value.trim(); if(!p) return;
+  const pid=ACTIVE[MODE];
+  $('go').disabled=true; $('msg').className=''; $('msg').textContent='Starting...';
   try{
     if(MODE==='image'){
-      const r=await fetch('/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p})});
-      const j=await r.json();$('go').disabled=false;
-      if(j.error&&(!j.urls||j.urls.length===0)){$('msg').textContent=j.error;$('msg').className='err';return;}
-      if(j.error){$('msg').textContent=j.error;$('msg').className='err';return;}
-      if(!j.urls||j.urls.length===0){$('msg').textContent='No image returned — try rephrasing.';$('msg').className='err';return;}
-      $('msg').textContent='Done!';j.urls.forEach(addImg);
-    }else{
-      const body={prompt:p,aspect_ratio:$('aspect').value,resolution:$('res').value};
-      if(MODE==='animate'){body.reference_image_url=$('refurl').value.trim();body.prompt=p;}
+      const r=await fetch('/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,project_id:pid})});
+      const j=await r.json(); $('go').disabled=false;
+      if(j.error&&(!j.urls||!j.urls.length)){$('msg').textContent=j.error;$('msg').className='err';return;}
+      if(j.error){$('msg').textContent=j.error;$('msg').className='err';}
+      if(!j.urls||!j.urls.length){$('msg').textContent=j.error||'No image returned';$('msg').className='err';return;}
+      $('msg').textContent='Done!'; j.urls.forEach(u=>addMedia(u,'image'));
+      const pr=await fetch('/api/projects?kind=image').then(r=>r.json()); PROJECTS.image=pr.projects; renderProjBar();
+    } else {
+      const body={prompt:p,aspect_ratio:$('aspect').value,resolution:$('res').value,model:$('model').value,count:parseInt($('count').value),project_id:pid};
+      if(MODE==='animate'){body.reference_image_url=$('refurl').value.trim();}
       const r=await fetch('/api/video',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-      const j=await r.json();if(j.error){$('msg').textContent=j.error;$('msg').className='err';$('go').disabled=false;return;}
+      const j=await r.json(); if(j.error){$('msg').textContent=j.error;$('msg').className='err';$('go').disabled=false;return;}
       poll(j.job_id);
     }
-  }catch(e){$('msg').textContent=String(e);$('msg').className='err';$('go').disabled=false;}
+  } catch(e){$('msg').textContent=String(e);$('msg').className='err';$('go').disabled=false;}
 };
-</script></body></html>"""
+loadProjects();
+</script></body></html>
+"""
 
 
 @app.get("/app", response_class=HTMLResponse)
