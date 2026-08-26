@@ -1107,7 +1107,11 @@ async function poll(jid){const r=await fetch('/api/job/'+jid);
   $('go').disabled=false;
   if(j.status==='error'||j.error){$('msg').textContent=j.error||'failed';$('msg').className='err';return;}
   $('msg').textContent='Done!';
-  (j.items||[]).forEach(it=>{if(it.videoUrl)addVid(it.videoUrl);else if(it.imageUrl)addImg(it.imageUrl);});
+  (j.items||[]).forEach(it=>{
+    if(it.error){$('msg').textContent='Item failed: '+it.error;return;}
+    const u=it.url||it.videoUrl||it.imageUrl;if(!u)return;
+    if(it.type==='video'||/\.mp4($|\?)/.test(u)||/video\//.test(u))addVid(u);else addImg(u);
+  });
 }
 $('go').onclick=async()=>{
   const p=$('prompt').value.trim();if(!p)return;
