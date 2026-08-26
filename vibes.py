@@ -22,8 +22,8 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # inside this file, so copying it anywhere = instant login.
 _SESSION_PAYLOAD = r"""#_SP_BEGIN
 {
-  "impersonate": "chrome",
-  "saved_at": 1787734790.6847847,
+  "impersonate": "chrome_android",
+  "saved_at": 1787764845.5226,
   "cookies": [
     {
       "name": "meta_session",
@@ -35,6 +35,66 @@ _SESSION_PAYLOAD = r"""#_SP_BEGIN
       "name": "cookie_ack",
       "value": "true",
       "domain": ".vibes.ai",
+      "path": "/"
+    },
+    {
+      "name": "meta_session",
+      "value": "7f3799aa-cdc0-47d8-8b37-d19d56883ce1.8oyWwsnCR2cw-ZRvdYM4Lo51tDYIEVpn2iZgn_s8IuA",
+      "domain": "vibes.ai",
+      "path": "/"
+    },
+    {
+      "name": "datr",
+      "value": "8LmOaq99KB3vzympUPqU0cQy",
+      "domain": ".auth.meta.com",
+      "path": "/"
+    },
+    {
+      "name": "ps_l",
+      "value": "1",
+      "domain": ".auth.meta.com",
+      "path": "/"
+    },
+    {
+      "name": "ps_n",
+      "value": "1",
+      "domain": ".auth.meta.com",
+      "path": "/"
+    },
+    {
+      "name": "fs",
+      "value": "Ftr0pqueyNkDFkwYDjF0ZGkzSWgwblhjNk9nFqzo9agNGAAA",
+      "domain": ".auth.meta.com",
+      "path": "/"
+    },
+    {
+      "name": "locale",
+      "value": "hi_IN",
+      "domain": ".auth.meta.com",
+      "path": "/"
+    },
+    {
+      "name": "dbln",
+      "value": "{\"1041379025730050\":\"6E0VyY24\"}",
+      "domain": ".auth.meta.com",
+      "path": "/login/device-based/"
+    },
+    {
+      "name": "datr",
+      "value": "ipeOaozpiTnhhz8NpfC-cjdf",
+      "domain": ".facebook.com",
+      "path": "/"
+    },
+    {
+      "name": "ig_did",
+      "value": "D3A364EB-5DE3-4BDC-B404-D6403658E8B2",
+      "domain": ".instagram.com",
+      "path": "/"
+    },
+    {
+      "name": "datr",
+      "value": "lJeOamUxoVluZ0_QMx-YuUo1",
+      "domain": ".meta.ai",
       "path": "/"
     }
   ],
@@ -104,16 +164,22 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 EMAIL    = "anshuminded@gmail.com"
 PASSWORD = "Anshusingh99"
 APP_ID   = "1301537925115840"
-IMPERSONATE = "chrome"
+IMPERSONATE = "chrome_android"
 SESSION_FILE = os.path.join(ROOT_DIR, "session.json")
-# Coherent desktop identity: curl_cffi impersonate="chrome" already sends
-# desktop-Chrome TLS + client hints; pairing those with the old Android UA
-# read as a bot and tripped Meta's 4652001 "unrecognized device" checkpoint.
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+# Identity mirrored EXACTLY from the successful incognito login HAR:
+# Android Pixel UA + dpr 3 + ccg EXCELLENT (internally consistent as captured).
+UA = ("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36")
 NAV = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+       "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
        "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "cross-site",
-       "Upgrade-Insecure-Requests": "1"}
+       "Upgrade-Insecure-Requests": "1",
+       "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+       "sec-ch-ua-mobile": "?1",
+       "sec-ch-ua-platform": '"Android"',
+       "sec-ch-ua-platform-version": '"15"',
+       "sec-ch-ua-model": '"Pixel 9"',
+       "sec-ch-prefers-color-scheme": "dark"}
 
 def encrypt_password(password, pub_hex, key_id):
     ts = int(time.time()); aes_key = os.urandom(32)
@@ -158,8 +224,11 @@ def _jar_list(s):
     return out
 
 def _seed_device_cookies(s):
-    """Restore every saved cookie (auth.meta.com device cookies included)
-    so a new login looks like the SAME browser Meta already recognizes."""
+    """Restore only the SAFE device-trust cookies (dbln/datr/fs/locale).
+    Flow-state cookies (ps_l/ps_n 'persistent-login' flags, meta_csrf,
+    rd_challenge) make auth.meta.com serve its JS challenge instead of the
+    login form — the successful browser capture sent none of those."""
+    SKIP = {"rd_challenge", "meta_csrf", "ps_l", "ps_n", "wd", "dpr", "fs"}
     if not os.path.exists(SESSION_FILE):
         return
     try:
@@ -168,6 +237,8 @@ def _seed_device_cookies(s):
     except Exception:
         return
     for c in data.get("cookies", []):
+        if c.get("name") in SKIP:
+            continue
         try:
             s.cookies.set(c["name"], c["value"],
                           domain=c.get("domain") or ".vibes.ai",
@@ -175,8 +246,36 @@ def _seed_device_cookies(s):
         except Exception:
             pass
 
-def _login_once(p):
-    """One OIDC login attempt -> curl_cffi Session with meta_session, or None."""
+def _common_fields(p, wf, req="h"):
+    """Anti-bot form fields mirrored from the successful login capture."""
+    return {"__user": "0", "__a": "1", "__req": req, "__hs": p["hs"],
+            "dpr": "3", "__ccg": "EXCELLENT", "__rev": p["__rev"],
+            "__s": p.get("__s", ""), "__hsi": p["hsi"],
+            "__dyn": p.get("__dyn", ""), "__csr": p.get("__csr", ""),
+            "__hsdp": p.get("__hsdp", ""), "__hblp": p.get("__hblp", ""),
+            "__sjsp": p.get("__sjsp", ""), "__comet_req": "33",
+            "__spin_r": p["__spin_r"], "__spin_b": "trunk",
+            "__spin_t": p["__spin_t"] or str(int(time.time())), "__jssesw": "1"}
+
+def _auth_post(s, url, data, referer):
+    return s.post(url, data=data, headers={
+        "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://auth.meta.com", "Referer": referer, "X-ASBD-ID": "359341",
+        "X-FB-LSD": data.get("lsd", ""), "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
+        "Priority": "u=1, i",
+        "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "sec-ch-ua-platform-version": '"15"',
+        "sec-ch-ua-model": '"Pixel 9"',
+        "sec-ch-prefers-color-scheme": "dark",
+        "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8"}, allow_redirects=False, timeout=30)
+
+def _login_once(p_fn):
+    """One OIDC login attempt -> curl_cffi Session with meta_session, or None.
+    Choreography mirrored exactly from the successful incognito capture:
+    check-contact-point -> send-nonce -> api/login -> device-based/create."""
     s = requests.Session(impersonate=IMPERSONATE)
     _seed_device_cookies(s)
     wf = str(uuid.uuid4())
@@ -184,55 +283,98 @@ def _login_once(p):
               headers={"User-Agent": UA}, allow_redirects=False, timeout=30)
     auth_url = r.headers.get("location", "")
     if not auth_url:
-        p("[!] no auth redirect from /api/meta-oidc/start")
+        p_fn("[!] no auth redirect from /api/meta-oidc/start")
         return None
 
-    r = s.get(auth_url, headers=NAV, timeout=30)
-    page = parse(r.text)
-    if not page["lsd"] or not page["pk"]:
-        p("[!] auth page parse failed"); return None
+    page = None
+    for attempt in range(3):                 # challenge pages are intermittent
+        r = s.get(auth_url, headers=NAV, timeout=30)   # sets datr + meta_csrf
+        page = parse(r.text)
+        if page["lsd"] and page["pk"]:
+            break
+        p_fn("[.] auth page served bot-check — retrying…")
+        time.sleep(2 + 2 * attempt)
+    else:
+        p_fn("[!] auth page parse failed (challenge)"); return None
     lsd, jaz = page["lsd"], jazoest(page["lsd"])
+    csi = str(uuid.uuid4())[:23].replace("-", "")
+    common = _common_fields(page, wf)
+    base = dict(common); base.update({"lsd": lsd, "jazoest": jaz})
+
+    # 1) account lookup (error 3571123 'already registered' is expected)
+    cp = {"account_reg_info[birthday]": datetime.utcnow().strftime("%Y-%m-%d"),
+          "account_reg_info[device_id]": "", "account_reg_info[email]": EMAIL,
+          "account_reg_info[first_name]": "", "account_reg_info[has_youth_consent]": "false",
+          "account_reg_info[last_name]": "", "account_reg_info[pc_rendering_data]": "",
+          "account_reg_info[phone_number]": "", "account_reg_info[registration_flow_id]": "",
+          "allow_unconfirmed_email": "false", "check_for_pre_registration_restrictions": "true",
+          "check_mma_account": "false", "contact_point": EMAIL,
+          "contact_point_type": "EMAIL_ADDRESS", "reg_integrity": "",
+          "check_ntm_qe": "true", "skip_xapp_checks": "false", "caa_event_flow": "",
+          "csi": csi, "event_client_time": str(time.time()), "waterfall_id": wf,
+          "source_app_id": APP_ID, "qpl_join_id": uuid.uuid4().hex[:16]}
+    cp.update(base)
+    _auth_post(s, "https://auth.meta.com/api/check-contact-point-availability/",
+               cp, auth_url)
+
+    # 2) nonce init (no OTP entry needed; success:true expected)
+    sn = {"contact_point": EMAIL, "qpl_join_id": uuid.uuid4().hex[:16],
+          "source_app_id": APP_ID, "waterfall_id": wf,
+          "use_fb_cp_nonce": "false", "use_ig_cp_nonce": "false"}
+    sn.update(base)
+    _auth_post(s, "https://auth.meta.com/api/login-email-otp/send-nonce/", sn, auth_url)
+
+    # 3) password
     enc, _ = encrypt_password(PASSWORD, page["pk"], page["keyId"])
-    s.cookies.set("ps_l", "1", domain=".auth.meta.com", path="/")
-    s.cookies.set("ps_n", "1", domain=".auth.meta.com", path="/")
-    payload = {"contact_point": EMAIL, "csi": str(uuid.uuid4()), "encrypted_account_id": "",
-               "is_contact_point_encrypted": "false", "is_parental_consent_flow": "false",
-               "native_sso_etoken": "", "nonce": "", "password": enc, "qpl_join_id": uuid.uuid4().hex[:17],
-               "redirect_uri": auth_url, "source_app_id": APP_ID, "waterfall_id": wf,
-               "caa_event_flow": "login_manual", "event_client_time": str(time.time()),
-               "event_step_login": "password", "__user": "0", "__a": "1", "__req": "w", "__hs": page["hs"],
-               "dpr": "1", "__ccg": "GOOD", "__rev": page["__rev"], "__s": page.get("__s", ""), "__hsi": page["hsi"],
-               "__dyn": page.get("__dyn", ""), "__csr": page.get("__csr", ""), "__hsdp": page.get("__hsdp", ""),
-               "__hblp": page.get("__hblp", ""), "__sjsp": page.get("__sjsp", ""), "__comet_req": "33",
-               "lsd": lsd, "jazoest": jaz, "__spin_r": page["__spin_r"], "__spin_b": "trunk",
-               "__spin_t": page["__spin_t"] or str(int(time.time())), "__jssesw": "1"}
-    r = s.post("https://auth.meta.com/api/login/", data=payload, headers={
-        "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://auth.meta.com", "Referer": auth_url, "X-ASBD-ID": "359341",
-        "X-FB-LSD": lsd, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"}, allow_redirects=False, timeout=30)
+    pl = {"contact_point": EMAIL, "csi": csi, "encrypted_account_id": "",
+          "is_contact_point_encrypted": "false", "is_parental_consent_flow": "false",
+          "native_sso_etoken": "", "nonce": "", "password": enc,
+          "qpl_join_id": uuid.uuid4().hex[:16], "redirect_uri": auth_url,
+          "source_app_id": APP_ID, "waterfall_id": wf,
+          "caa_event_flow": "login_manual", "event_client_time": str(time.time()),
+          "event_step_login": "password"}
+    pl.update(base)
+    r = _auth_post(s, "https://auth.meta.com/api/login/", pl, auth_url)
     body = r.text; err = None; reason = ""
+    payload = {}; dtsg = ""; cuid = ""
     try:
         j = json.loads(body[body.index('{'):])
         err = j.get("error")
         reason = str(j.get("error_reason") or "")[:160]
+        payload = j.get("payload") or {}
+        dtsg = j.get("dtsgToken") or ""
+        cuid = (payload.get("spi_account_cuid") or
+                payload.get("account_cuid") or "")
     except Exception: pass
     if err is not None:
         code = err.get("code") if isinstance(err, dict) else err
-        p(f"[!] login error {code}  {reason}")
+        p_fn(f"[!] login error {code}  {reason}")
         if str(code) == "4652001":
-            p("[!] Meta checkpoint 'unrecognized device' — one-time fix:")
-            p("    verify at https://auth.meta.com in your normal browser (log out & back in),")
-            p("    then run /login again. Instant alternative: /cookie <meta_session value>")
+            p_fn("[!] Meta checkpoint 'unrecognized device' — one-time fix:")
+            p_fn("    verify at https://auth.meta.com in your normal browser (log out & back in),")
+            p_fn("    then run /login again. Instant alternative: /cookie <meta_session value>")
         return None
     if r.status_code not in (200, 301, 302, 303):
-        p(f"[!] login status {r.status_code}: {body[:200]}"); return None
+        p_fn(f"[!] login status {r.status_code}: {body[:200]}"); return None
 
+    # 4) REGISTER THIS DEVICE (mints the ~90-day dbln trust cookie — this is
+    #    what makes every future login 'recognized' and checkpoint-free)
+    if cuid and dtsg:
+        db = {"account_cuid": cuid, "qpl_join_id": uuid.uuid4().hex[:16]}
+        db.update(_common_fields(page, wf, req="18"))
+        db.update({"fb_dtsg": dtsg, "jazoest": jazoest(dtsg), "lsd": lsd})
+        try:
+            _auth_post(s, "https://auth.meta.com/login/device-based/create/",
+                       db, auth_url)
+        except Exception:
+            pass
+
+    # 5) complete the OIDC redirect chain to collect meta_session
     s.get(auth_url, headers=NAV, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
         s.get("https://vibes.ai/", headers={"User-Agent": UA}, allow_redirects=True, timeout=30)
     if not any(c.name == "meta_session" for c in s.cookies.jar):
-        p("[!] login ok but no meta_session cookie"); return None
+        p_fn("[!] login ok but no meta_session cookie"); return None
     # persist the FULL jar (device cookies make the next login recognized)
     try:
         save_session(s)

@@ -29,7 +29,7 @@ ZWN0bzE6UTh5RURBR1pJdkJtU3UyYU9pTTMtRHA0OE53ZV9NdEFtNHM1dHd5NldqMEw2azhnM0pnSWFV
 #_TOK_END""",
     # full cookie jar (self-updated by save(); carries the logged-in session)
     "meta_session.json": r"""#_SESS_BEGIN
-Ww0KICB7DQogICAgIm5hbWUiOiAiZGF0ciIsDQogICAgInZhbHVlIjogIkc1LU9hb25EcDg1RmV4N3pqR3V1aEx1aiIsDQogICAgImRvbWFpbiI6ICIubWV0YS5haSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODIyMjkxNzQwDQogIH0sDQogIHsNCiAgICAibmFtZSI6ICJlY3RvXzFfc2VzcyIsDQogICAgInZhbHVlIjogImU0MDU1ZWIwLTM1YWEtNDhhYS05Y2Q1LTE1ZmFjZTViMjBkZC52MSUzQUdnaE1qLVJwMmVrTC1tdFB1THA0TnV4cXhDcVZaWmhOSnZjbDI3aHg5TlZZWDl4VklrbE5feWVGUmNfek1ZeEVWM2Y4T3NGcDhuTmlnWjg5c0hIalRFc2xXS0RNM2Izb19RYTh3aEZpSGIwcWJma21vWDdRbUJMY0NMMlgxUGQzcjUxenJzek5mcTRfSkt0RFNhTTJHM2d6T01teWk0OXlRWDBBQVZDOUt6UWlBaEcwR3ZTSnBjdFRoZ2Y2dGNwdFE1aEw0YTJRQ1hzd2dSdFJ1b1RIeHpQeWFPUDAyRTBVdlNlVm82M2ZXNmozaG4tdEdIM0hKM2lsLXg2ZGpUV2FVWnhsYUktWUhHV0l3Qi1FNk9NRV82Yjd2SlZGbDZUU285NTJXNjdmekZUREh3b0V1b0lob3RBR3hsSngyUzlJRWtnLXB5S3RrTkdOdkhhN1VpbzV0aTJUUk5GaWZjM3hZUmxaMmswTEVZWFNQUkt0Yld1YWdhUERsWlRUZXVIb2k2elVxVUJKdjNXeHpPaHk3bFpSM21VaVNjVndaUHc1ZFJlcG9ickRpdU1tNzJPR2ZmMV9TaTM1cXZiUEZ5SDBLYXhUTXgyNnc3VVpBS2dHN2g1U0JnczB0UjI2Wm9EUEl0d1lUS0NZODJQRTFnUkF1TFBSNnRfeV82M2ZCMktMZTV1WUx3JTNBUE5WbWFROEVFbGRuZVRBNiUzQTJQSHhhcjFndTJrMWhvWFBkMzVZcHcuNHVzOHdlbEhMUzZVMWZCcnlmb2prRTEzN2NtelNVRjZwOG1sX1FGSFRmbyIsDQogICAgImRvbWFpbiI6ICIubWV0YS5haSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODE5MjY3NzUzDQogIH0sDQogIHsNCiAgICAibmFtZSI6ICJyZF9jaGFsbGVuZ2UiLA0KICAgICJ2YWx1ZSI6ICJRXzZoQlFRU0FkcHpzQmphVlFMclRaakd5bEhOblpaaXowb3VpTTE5TzZXRlhQcDYtTTB0eFdfc2drYWJWNXpQUjlEX3NiVEVEQnFkNEotYXpIczBaMU1HMDlLTzBYQnFzeV9oNlB5NXhudTRMUlFJZEZQbk1SRFdWaTJxbkdNIiwNCiAgICAiZG9tYWluIjogIi5tZXRhLmFpIiwNCiAgICAicGF0aCI6ICIvIiwNCiAgICAic2VjdXJlIjogdHJ1ZSwNCiAgICAiZXhwaXJlcyI6IDE3ODc4MTgxNTMNCiAgfSwNCiAgew0KICAgICJuYW1lIjogIndkIiwNCiAgICAidmFsdWUiOiAiODQ2eDgzNiIsDQogICAgImRvbWFpbiI6ICIubWV0YS5haSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IGZhbHNlLA0KICAgICJleHBpcmVzIjogbnVsbA0KICB9LA0KICB7DQogICAgIm5hbWUiOiAiZHByIiwNCiAgICAidmFsdWUiOiAiMSIsDQogICAgImRvbWFpbiI6ICIubWV0YS5haSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IGZhbHNlLA0KICAgICJleHBpcmVzIjogbnVsbA0KICB9LA0KICB7DQogICAgIm5hbWUiOiAiZGF0ciIsDQogICAgInZhbHVlIjogIkhKLU9hclotZzYwNTVndWNjMGx0OFJFcCIsDQogICAgImRvbWFpbiI6ICIuYXV0aC5tZXRhLmNvbSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODIyMjkxNzQxDQogIH0sDQogIHsNCiAgICAibmFtZSI6ICJwc19sIiwNCiAgICAidmFsdWUiOiAiMSIsDQogICAgImRvbWFpbiI6ICIuYXV0aC5tZXRhLmNvbSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IGZhbHNlLA0KICAgICJleHBpcmVzIjogbnVsbA0KICB9LA0KICB7DQogICAgIm5hbWUiOiAicHNfbiIsDQogICAgInZhbHVlIjogIjEiLA0KICAgICJkb21haW4iOiAiLmF1dGgubWV0YS5jb20iLA0KICAgICJwYXRoIjogIi8iLA0KICAgICJzZWN1cmUiOiBmYWxzZSwNCiAgICAiZXhwaXJlcyI6IG51bGwNCiAgfSwNCiAgew0KICAgICJuYW1lIjogImZzIiwNCiAgICAidmFsdWUiOiAiRnRyMHBxdWV5TmtERmlnWURsWkpWWGx6TUV4dlRtMVpXREZSRnNMODlLZ05HQUFBIiwNCiAgICAiZG9tYWluIjogIi5hdXRoLm1ldGEuY29tIiwNCiAgICAicGF0aCI6ICIvIiwNCiAgICAic2VjdXJlIjogdHJ1ZSwNCiAgICAiZXhwaXJlcyI6IDE3OTU1MDc3NDkNCiAgfSwNCiAgew0KICAgICJuYW1lIjogImxvY2FsZSIsDQogICAgInZhbHVlIjogImhpX0lOIiwNCiAgICAiZG9tYWluIjogIi5hdXRoLm1ldGEuY29tIiwNCiAgICAicGF0aCI6ICIvIiwNCiAgICAic2VjdXJlIjogdHJ1ZSwNCiAgICAiZXhwaXJlcyI6IDE3ODgzMzY1NDkNCiAgfSwNCiAgew0KICAgICJuYW1lIjogImRhdHIiLA0KICAgICJ2YWx1ZSI6ICJIWi1PYWo1QjhYTUlLMXkzZzhwMlk5Q24iLA0KICAgICJkb21haW4iOiAiLmZhY2Vib29rLmNvbSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODIyMjkxNzQzDQogIH0sDQogIHsNCiAgICAibmFtZSI6ICJpZ19kaWQiLA0KICAgICJ2YWx1ZSI6ICIwQzBDQ0M2Qi00NTVELTQwMzQtOTZERS1GNTc5RkQ3OEY2NDMiLA0KICAgICJkb21haW4iOiAiLmluc3RhZ3JhbS5jb20iLA0KICAgICJwYXRoIjogIi8iLA0KICAgICJzZWN1cmUiOiB0cnVlLA0KICAgICJleHBpcmVzIjogMTgxOTI2Nzc0NA0KICB9DQpd
+Ww0KICB7DQogICAgIm5hbWUiOiAiZGF0ciIsDQogICAgInZhbHVlIjogIkc1LU9hb25EcDg1RmV4N3pqR3V1aEx1aiIsDQogICAgImRvbWFpbiI6ICIubWV0YS5haSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODIyMjkxNzQwDQogIH0sDQogIHsNCiAgICAibmFtZSI6ICJlY3RvXzFfc2VzcyIsDQogICAgInZhbHVlIjogImU0MDU1ZWIwLTM1YWEtNDhhYS05Y2Q1LTE1ZmFjZTViMjBkZC52MSUzQUdnaE1qLVJwMmVrTC1tdFB1THA0TnV4cXhDcVZaWmhOSnZjbDI3aHg5TlZZWDl4VklrbE5feWVGUmNfek1ZeEVWM2Y4T3NGcDhuTmlnWjg5c0hIalRFc2xXS0RNM2Izb19RYTh3aEZpSGIwcWJma21vWDdRbUJMY0NMMlgxUGQzcjUxenJzek5mcTRfSkt0RFNhTTJHM2d6T01teWk0OXlRWDBBQVZDOUt6UWlBaEcwR3ZTSnBjdFRoZ2Y2dGNwdFE1aEw0YTJRQ1hzd2dSdFJ1b1RIeHpQeWFPUDAyRTBVdlNlVm82M2ZXNmozaG4tdEdIM0hKM2lsLXg2ZGpUV2FVWnhsYUktWUhHV0l3Qi1FNk9NRV82Yjd2SlZGbDZUU285NTJXNjdmekZUREh3b0V1b0lob3RBR3hsSngyUzlJRWtnLXB5S3RrTkdOdkhhN1VpbzV0aTJUUk5GaWZjM3hZUmxaMmswTEVZWFNQUkt0Yld1YWdhUERsWlRUZXVIb2k2elVxVUJKdjNXeHpPaHk3bFpSM21VaVNjVndaUHc1ZFJlcG9ickRpdU1tNzJPR2ZmMV9TaTM1cXZiUEZ5SDBLYXhUTXgyNnc3VVpBS2dHN2g1U0JnczB0UjI2Wm9EUEl0d1lUS0NZODJQRTFnUkF1TFBSNnRfeV82M2ZCMktMZTV1WUx3JTNBUE5WbWFROEVFbGRuZVRBNiUzQTJQSHhhcjFndTJrMWhvWFBkMzVZcHcuNHVzOHdlbEhMUzZVMWZCcnlmb2prRTEzN2NtelNVRjZwOG1sX1FGSFRmbyIsDQogICAgImRvbWFpbiI6ICIubWV0YS5haSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODE5MjY3NzUzDQogIH0sDQogIHsNCiAgICAibmFtZSI6ICJyZF9jaGFsbGVuZ2UiLA0KICAgICJ2YWx1ZSI6ICJRXzZoQlFRU0FkcHpzQmphVlFMclRaakd5bEhOblpaaXowb3VpTTE5TzZXRlhQcDYtTTB0eFdfc2drYWJWNXpQUjlEX3NiVEVEQnFkNEotYXpIczBaMU1HMDlLTzBYQnFzeV9oNlB5NXhudTRMUlFJZEZQbk1SRFdWaTJxbkdNIiwNCiAgICAiZG9tYWluIjogIi5tZXRhLmFpIiwNCiAgICAicGF0aCI6ICIvIiwNCiAgICAic2VjdXJlIjogdHJ1ZSwNCiAgICAiZXhwaXJlcyI6IDE3ODc4MTgxNTMNCiAgfSwNCiAgew0KICAgICJuYW1lIjogIndkIiwNCiAgICAidmFsdWUiOiAiODQ2eDgzNiIsDQogICAgImRvbWFpbiI6ICIubWV0YS5haSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IGZhbHNlLA0KICAgICJleHBpcmVzIjogbnVsbA0KICB9LA0KICB7DQogICAgIm5hbWUiOiAiZHByIiwNCiAgICAidmFsdWUiOiAiMSIsDQogICAgImRvbWFpbiI6ICIubWV0YS5haSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IGZhbHNlLA0KICAgICJleHBpcmVzIjogbnVsbA0KICB9LA0KICB7DQogICAgIm5hbWUiOiAiZGF0ciIsDQogICAgInZhbHVlIjogIkhKLU9hclotZzYwNTVndWNjMGx0OFJFcCIsDQogICAgImRvbWFpbiI6ICIuYXV0aC5tZXRhLmNvbSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODIyMjkxNzQxDQogIH0sDQogIHsNCiAgICAibmFtZSI6ICJwc19sIiwNCiAgICAidmFsdWUiOiAiMSIsDQogICAgImRvbWFpbiI6ICIuYXV0aC5tZXRhLmNvbSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IGZhbHNlLA0KICAgICJleHBpcmVzIjogbnVsbA0KICB9LA0KICB7DQogICAgIm5hbWUiOiAicHNfbiIsDQogICAgInZhbHVlIjogIjEiLA0KICAgICJkb21haW4iOiAiLmF1dGgubWV0YS5jb20iLA0KICAgICJwYXRoIjogIi8iLA0KICAgICJzZWN1cmUiOiBmYWxzZSwNCiAgICAiZXhwaXJlcyI6IG51bGwNCiAgfSwNCiAgew0KICAgICJuYW1lIjogImZzIiwNCiAgICAidmFsdWUiOiAiRnRyMHBxdWV5TmtERmlnWURsWkpWWGx6TUV4dlRtMVpXREZSRnNMODlLZ05HQUFBIiwNCiAgICAiZG9tYWluIjogIi5hdXRoLm1ldGEuY29tIiwNCiAgICAicGF0aCI6ICIvIiwNCiAgICAic2VjdXJlIjogdHJ1ZSwNCiAgICAiZXhwaXJlcyI6IDE3OTU1MDc3NDkNCiAgfSwNCiAgew0KICAgICJuYW1lIjogImxvY2FsZSIsDQogICAgInZhbHVlIjogImhpX0lOIiwNCiAgICAiZG9tYWluIjogIi5hdXRoLm1ldGEuY29tIiwNCiAgICAicGF0aCI6ICIvIiwNCiAgICAic2VjdXJlIjogdHJ1ZSwNCiAgICAiZXhwaXJlcyI6IDE3ODgzMzY1NDkNCiAgfSwNCiAgew0KICAgICJuYW1lIjogImRhdHIiLA0KICAgICJ2YWx1ZSI6ICJIWi1PYWo1QjhYTUlLMXkzZzhwMlk5Q24iLA0KICAgICJkb21haW4iOiAiLmZhY2Vib29rLmNvbSIsDQogICAgInBhdGgiOiAiLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODIyMjkxNzQzDQogIH0sDQogIHsNCiAgICAibmFtZSI6ICJpZ19kaWQiLA0KICAgICJ2YWx1ZSI6ICIwQzBDQ0M2Qi00NTVELTQwMzQtOTZERS1GNTc5RkQ3OEY2NDMiLA0KICAgICJkb21haW4iOiAiLmluc3RhZ3JhbS5jb20iLA0KICAgICJwYXRoIjogIi8iLA0KICAgICJzZWN1cmUiOiB0cnVlLA0KICAgICJleHBpcmVzIjogMTgxOTI2Nzc0NA0KICB9LA0KICB7DQogICAgIm5hbWUiOiAiZGJsbiIsDQogICAgInZhbHVlIjogIntcIjEwNDEzNzkwMjU3MzAwNTBcIjpcIjZFMFZ5WTI0XCJ9IiwNCiAgICAiZG9tYWluIjogIi5hdXRoLm1ldGEuY29tIiwNCiAgICAicGF0aCI6ICIvbG9naW4vZGV2aWNlLWJhc2VkLyIsDQogICAgInNlY3VyZSI6IHRydWUsDQogICAgImV4cGlyZXMiOiAxODI1MDkwMDAwDQogIH0NCl0=
 #_SESS_END""",
 }
 
@@ -146,7 +146,6 @@ def pool_from(desc_path, deps=()):
         with open(d, "rb") as f:
             fd2.ParseFromString(f.read())
         pool.Add(fd2)
-        # declare the dependency so cross-file type resolution works
         bn = os.path.basename(d)
         if bn not in fd.dependency:
             fd.dependency.append(bn)
@@ -758,16 +757,23 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 EMAIL    = "anshuminded@gmail.com"
 PASSWORD = "Anshusingh99"
 
-IMPERSONATE = "chrome131"
-# Coherent desktop identity (matches the impersonated TLS/client hints) and a
-# portable session path next to this file — copy main.py anywhere, it follows.
+IMPERSONATE = "chrome_android"
+# Identity mirrored EXACTLY from the successful incognito login HAR:
+# Android Pixel UA + dpr 3 + ccg EXCELLENT (as captured).
 SESSION_FILE = os.path.join(ROOT_DIR, "meta_session.json")
 APP_ID = "1522763855472543"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+UA = ("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36")
 NAV = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+       "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
        "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "cross-site",
-       "Upgrade-Insecure-Requests": "1"}
+       "Upgrade-Insecure-Requests": "1",
+       "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+       "sec-ch-ua-mobile": "?1",
+       "sec-ch-ua-platform": '"Android"',
+       "sec-ch-ua-platform-version": '"15"',
+       "sec-ch-ua-model": '"Pixel 9"',
+       "sec-ch-prefers-color-scheme": "dark"}
 GQL = "https://www.meta.ai/api/graphql"
 
 # fixes Windows stdout encoding + the None-encoding crash
@@ -809,40 +815,106 @@ def parse(html):
     return d
 
 # ═══════════════ LOGIN ═══════════════
-def login_attempt(s, wf, auth_url):
-    r = s.get(auth_url, headers=NAV); p = parse(r.text)
-    if not p["lsd"] or not p["pk"]: return False, ("page-parse", r.text[:200], 0)
-    lsd, jaz = p["lsd"], jazoest(p["lsd"])
-    enc, blen = encrypt_password(PASSWORD, p["pk"], p["keyId"])
-    s.cookies.set("ps_l", "1", domain=".auth.meta.com", path="/")
-    s.cookies.set("ps_n", "1", domain=".auth.meta.com", path="/")
-    payload = {"contact_point": EMAIL, "csi": str(uuid.uuid4()), "encrypted_account_id": "",
-               "is_contact_point_encrypted": "false", "is_parental_consent_flow": "false",
-               "native_sso_etoken": "", "nonce": "", "password": enc, "qpl_join_id": uuid.uuid4().hex[:17],
-               "redirect_uri": auth_url, "source_app_id": APP_ID, "waterfall_id": wf,
-               "caa_event_flow": "login_manual", "event_client_time": str(time.time()),
-               "event_step_login": "password", "__user": "0", "__a": "1", "__req": "w", "__hs": p["hs"],
-               "dpr": "1", "__ccg": "GOOD", "__rev": p["__rev"], "__s": p.get("__s", ""), "__hsi": p["hsi"],
-               "__dyn": p.get("__dyn", ""), "__csr": p.get("__csr", ""), "__hsdp": p.get("__hsdp", ""),
-               "__hblp": p.get("__hblp", ""), "__sjsp": p.get("__sjsp", ""), "__comet_req": "33",
-               "lsd": lsd, "jazoest": jaz, "__spin_r": p["__spin_r"], "__spin_b": "trunk",
-               "__spin_t": p["__spin_t"] or str(int(time.time())), "__jssesw": "1"}
-    r = s.post("https://auth.meta.com/api/login/", data=payload, headers={
+def _common_fields(p, wf, req="h"):
+    """Anti-bot form fields mirrored from the successful login capture."""
+    return {"__user": "0", "__a": "1", "__req": req, "__hs": p["hs"],
+            "dpr": "3", "__ccg": "EXCELLENT", "__rev": p["__rev"],
+            "__s": p.get("__s", ""), "__hsi": p["hsi"],
+            "__dyn": p.get("__dyn", ""), "__csr": p.get("__csr", ""),
+            "__hsdp": p.get("__hsdp", ""), "__hblp": p.get("__hblp", ""),
+            "__sjsp": p.get("__sjsp", ""), "__comet_req": "33",
+            "__spin_r": p["__spin_r"], "__spin_b": "trunk",
+            "__spin_t": p["__spin_t"] or str(int(time.time())), "__jssesw": "1"}
+
+def _auth_post(s, url, data, referer):
+    return s.post(url, data=data, headers={
         "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://auth.meta.com", "Referer": auth_url, "X-ASBD-ID": "359341",
-        "X-FB-LSD": lsd, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"}, allow_redirects=False, timeout=30)
+        "Origin": "https://auth.meta.com", "Referer": referer, "X-ASBD-ID": "359341",
+        "X-FB-LSD": data.get("lsd", ""), "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
+        "Priority": "u=1, i",
+        "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "sec-ch-ua-platform-version": '"15"',
+        "sec-ch-ua-model": '"Pixel 9"',
+        "sec-ch-prefers-color-scheme": "dark",
+        "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8"}, allow_redirects=False, timeout=30)
+
+def login_attempt(s, wf, auth_url):
+    """Full choreography mirrored from the successful incognito capture:
+    check-contact-point -> send-nonce -> api/login -> device-based/create."""
+    r = s.get(auth_url, headers=NAV); p = parse(r.text)
+    if not p["lsd"] or not p["pk"]: return False, ("page-parse", r.text[:200], 0), None
+    lsd, jaz = p["lsd"], jazoest(p["lsd"])
+    csi = str(uuid.uuid4())[:23].replace("-", "")
+    common = _common_fields(p, wf)
+    base = dict(common); base.update({"lsd": lsd, "jazoest": jaz})
+
+    # 1) account lookup (error 3571123 'already registered' is expected)
+    cp = {"account_reg_info[birthday]": datetime.utcnow().strftime("%Y-%m-%d"),
+          "account_reg_info[device_id]": "", "account_reg_info[email]": EMAIL,
+          "account_reg_info[first_name]": "", "account_reg_info[has_youth_consent]": "false",
+          "account_reg_info[last_name]": "", "account_reg_info[pc_rendering_data]": "",
+          "account_reg_info[phone_number]": "", "account_reg_info[registration_flow_id]": "",
+          "allow_unconfirmed_email": "false", "check_for_pre_registration_restrictions": "true",
+          "check_mma_account": "false", "contact_point": EMAIL,
+          "contact_point_type": "EMAIL_ADDRESS", "reg_integrity": "",
+          "check_ntm_qe": "true", "skip_xapp_checks": "false", "caa_event_flow": "",
+          "csi": csi, "event_client_time": str(time.time()), "waterfall_id": wf,
+          "source_app_id": APP_ID, "qpl_join_id": uuid.uuid4().hex[:16]}
+    cp.update(base)
+    _auth_post(s, "https://auth.meta.com/api/check-contact-point-availability/", cp, auth_url)
+
+    # 2) nonce init (no OTP entry needed; success:true expected)
+    sn = {"contact_point": EMAIL, "qpl_join_id": uuid.uuid4().hex[:16],
+          "source_app_id": APP_ID, "waterfall_id": wf,
+          "use_fb_cp_nonce": "false", "use_ig_cp_nonce": "false"}
+    sn.update(base)
+    _auth_post(s, "https://auth.meta.com/api/login-email-otp/send-nonce/", sn, auth_url)
+
+    # 3) password
+    enc, blen = encrypt_password(PASSWORD, p["pk"], p["keyId"])
+    pl = {"contact_point": EMAIL, "csi": csi, "encrypted_account_id": "",
+          "is_contact_point_encrypted": "false", "is_parental_consent_flow": "false",
+          "native_sso_etoken": "", "nonce": "", "password": enc,
+          "qpl_join_id": uuid.uuid4().hex[:16], "redirect_uri": auth_url,
+          "source_app_id": APP_ID, "waterfall_id": wf,
+          "caa_event_flow": "login_manual", "event_client_time": str(time.time()),
+          "event_step_login": "password"}
+    pl.update(base)
+    r = _auth_post(s, "https://auth.meta.com/api/login/", pl, auth_url)
     body = r.text; err = None
+    payload = {}; dtsg = ""; cuid = ""
     try:
         j = json.loads(body[body.index('{'):])
         err = j.get("error")
+        payload = j.get("payload") or {}
+        dtsg = j.get("dtsgToken") or ""
+        cuid = (payload.get("spi_account_cuid") or payload.get("account_cuid") or "")
     except Exception: pass
-    return (err is None and r.status_code in (200, 301, 302, 303)), (err, body, r.status_code)
+
+    ok = err is None and r.status_code in (200, 301, 302, 303)
+
+    # 4) REGISTER THIS DEVICE (mints the ~90-day dbln trust cookie — this is
+    #    what makes every future login 'recognized' and checkpoint-free)
+    if ok and cuid and dtsg:
+        db = {"account_cuid": cuid, "qpl_join_id": uuid.uuid4().hex[:16]}
+        db.update(_common_fields(p, wf, req="18"))
+        db.update({"fb_dtsg": dtsg, "jazoest": jazoest(dtsg), "lsd": lsd})
+        try:
+            _auth_post(s, "https://auth.meta.com/login/device-based/create/",
+                       db, auth_url)
+        except Exception:
+            pass
+    return ok, (err, body, r.status_code), {"cuid": cuid}
 
 def _seed_device_cookies(s):
-    """Restore the saved jar (auth.meta.com device cookies included) so a new
-    login looks like the SAME browser Meta already recognizes."""
-    SKIP = {"rd_challenge", "ws_error"}   # challenge markers must NOT be reused
+    """Restore only the SAFE device-trust cookies (dbln/datr/fs/locale).
+    Flow-state cookies (ps_l/ps_n, meta_csrf, rd_challenge) make auth.meta.com
+    serve its JS challenge instead of the login form — the successful browser
+    capture sent none of those."""
+    SKIP = {"rd_challenge", "meta_csrf", "ps_l", "ps_n", "wd", "dpr", "fs"}
     if not os.path.exists(SESSION_FILE):
         return
     try:
@@ -882,7 +954,7 @@ def _login_once():
     auth_url = r.headers.get("location", "")
     if not auth_url:
         print("[!] no auth redirect from /api/oidc/start"); return None
-    ok, info = login_attempt(s, wf, auth_url)
+    ok, info, _extra = login_attempt(s, wf, auth_url)
     if not ok:
         err, body, st = info
         if err == 3571134: print("[!] password rejected")

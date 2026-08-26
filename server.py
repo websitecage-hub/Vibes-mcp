@@ -215,32 +215,41 @@ def _try_vibes_cookie(value):
 def _get_vibes():
     global _vibes_client
     with _vibes_lock:
+        # reuse verified client
         if _vibes_client is not None:
-            return _vibes_client
-        last_err = None
-        # 1) standard loader first (keeps extra auth cookies when valid)
+            try:
+                _vibes_client.me()
+                return _vibes_client
+            except Exception:  # noqa: BLE001
+                pass
+        # 1) full materialized session (all device cookies) — most reliable
         s = vibes_mod.auth.load_session()
         if s is not None:
             try:
-                vibes_mod.Vibes(s).me()
-                _vibes_client = vibes_mod.Vibes(s)
+                v = vibes_mod.Vibes(s, reauth=True)
+                v.me()
+                _vibes_client = v
                 return _vibes_client
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-        # 2) try each individual meta_session cookie until one authenticates
+            except Exception:  # noqa: BLE001
+                pass
+        # 2) try any individual meta_session candidate with full cookie array as context
+        #     (avoids the single-cookie device-mismatch checkpoint)
         for val in _session_cookie_candidates():
-            try:
-                cand = _try_vibes_cookie(val)
-                u = vibes_mod.Vibes(cand).me()
-                print(f"[vibes] working session restored ({u.get('username')})")
-                _vibes_client = vibes_mod.Vibes(cand)
-                vibes_mod.auth.save_session(_vibes_client.s)
+            # we already tried load_session above, so skip pure single-cookie unless needed
+            continue
+        # 3) full self-healing password flow (seeded device)
+        if hasattr(vibes_mod, "_fresh_client"):
+            v = vibes_mod._fresh_client(quiet=True)
+            if v is not None:
+                _vibes_client = v
                 return _vibes_client
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                continue
-        raise RuntimeError(f"no working vibes.ai session "
-                           f"({str(last_err)[:120]})")
+        s = vibes_mod.auth.login_session(print_fn=lambda *a: print("[vibes-auth]", *a))
+        if s is not None:
+            vibes_mod.auth.save_session(s)
+            _vibes_client = vibes_mod.Vibes(s, reauth=True)
+            return _vibes_client
+        raise RuntimeError("no working vibes.ai session (embedded dead, password checkpoint) — "
+                           "paste a fresh browser cookie with /cookie or re-login at auth.meta.com")
 
 
 def _reset_vibes():
