@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """vibes.ai - full-featured CLI client for everything the web app can do.
 
-SINGLE-FILE build with self-healing login: the newest working session is
-persisted (session.json + embedded copy inside this file), startup
-auto-logs-in when the saved cookie goes stale, mid-session 401s silently
-re-login, and /cookie <value> gives instant access from any browser.
+SINGLE-FILE build with FULLY AUTOMATIC session self-healing: sessions are
+carried inside the file (priority: env VIBES_SESSION -> ./session.json ->
+embedded copy, which self-updates on every save). If a session dies or is
+missing, the script regenerates it by itself — no manual /login needed.
 /mode /projects /use /img /v /ref /audio /lipsync /voices …
 """
 import io, json, os, sys, time, uuid, random, threading, re, base64
@@ -23,7 +23,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SESSION_PAYLOAD = r"""#_SP_BEGIN
 {
   "impersonate": "chrome",
-  "saved_at": 1787694366.0924575,
+  "saved_at": 1787734790.6847847,
   "cookies": [
     {
       "name": "meta_session",
@@ -258,8 +258,18 @@ def login_session(print_fn=print, attempts=3):
         p(f"[!] login failed after {attempts} attempts")
     return None
 
+def _session_from_cookie(ms, impersonate=None):
+    s = requests.Session(impersonate=impersonate or IMPERSONATE)
+    s.cookies.set("meta_session", ms, domain=".vibes.ai", path="/")
+    s.cookies.set("cookie_ack", "true", domain=".vibes.ai", path="/")
+    return s
+
 def load_session():
-    """Rehydrate a curl_cffi Session from session.json (full jar), or None."""
+    """Session priority: env VIBES_SESSION -> session.json -> embedded
+    payload. Cookie/token mode only — never triggers password login."""
+    t = os.environ.get("VIBES_SESSION", "").strip()
+    if t:
+        return _session_from_cookie(t)
     if not os.path.exists(SESSION_FILE):
         return None
     try:
@@ -370,7 +380,7 @@ IMAGE_MODELS = ["midjen-base", "midjen", "sd", "imagen", "dall-e"]
 VIDEO_MODELS = ["midjen-short", "midjen-long", "midjen", "meta-juggernaut", "sora", "veo"]
 
 class Vibes:
-    def __init__(self, s, reauth=True):
+    def __init__(self, s, reauth=False):
         self.s = s
         self.user = None
         self.last_project = None
@@ -1207,6 +1217,49 @@ def _fresh_client(quiet=False):
         pass
     return v
 
+# ── automatic self-healing session regeneration ──────────────────────────
+_auto = {"fails": 0, "last": 0.0}
+_AUTO_MAX_FAILS = 5          # stop after N consecutive failures per run
+_AUTO_BACKOFF = 30           # seconds between attempts, grows each fail
+
+def _auto_login():
+    """Regenerate a dead/missing session automatically: password flow
+    (seeded device cookies make it look like the same browser), then save
+    + re-embed the new cookie. Backs off between failed attempts."""
+    global C
+    now = time.time()
+    if _auto["fails"] >= _AUTO_MAX_FAILS:
+        return False
+    wait = _auto["fails"] * _AUTO_BACKOFF
+    if now - _auto["last"] < wait:
+        return False
+    print("[*] session dead/missing → regenerating automatically…")
+    c = None
+    try:
+        c = _fresh_client(quiet=True)
+    except Exception:
+        c = None
+    if c is not None:
+        _auto["fails"], _auto["last"] = 0, 0.0
+        C = c
+        try:
+            u = c.me()
+            print(f"[+] auto-relogin OK as {u['username']} — new session saved & embedded")
+        except Exception:
+            print("[+] auto-relogin OK — new session saved & embedded")
+        return True
+    _auto["fails"] += 1
+    _auto["last"] = time.time()
+    if _auto["fails"] >= _AUTO_MAX_FAILS:
+        print("[!] auto-login blocked repeatedly by Meta (device checkpoint).")
+        print("    ONE-TIME fix: log out & back in at https://auth.meta.com in your normal")
+        print("    browser, then rerun — from then on this script self-heals on its own.")
+        print("    Instant alternative: /cookie <meta_session value> from any logged-in browser.")
+    else:
+        print(f"[.] auto-relogin failed ({_auto['fails']}/{_AUTO_MAX_FAILS}) — will retry in "
+              f"{_auto['fails'] * _AUTO_BACKOFF}s or on your next command")
+    return False
+
 def dispatch(op, arg):
     global CUR, OREF, AUDIO, C
     v = C
@@ -1471,25 +1524,21 @@ def repl():
     C = None
     s = auth.load_session()
     if s:
-        probe = Vibes(s)
+        C = Vibes(s)
         try:
-            u = probe.me()
-            C = probe
+            u = C.me()
             print(f"[+] session: {u['username']}")
+            try:
+                auth.save_session(C.s)   # persist any rotation, keep embedded copy fresh
+            except Exception:
+                pass
         except Exception:
-            print("[.] saved session stale — logging in fresh…")
-    if C is None:
-        print("[*] automatic login (embedded account)…")
-        C = _fresh_client()
-    if C is None:
-        print("[!] automatic login blocked. Two fixes:")
-        print("    1) verify once at https://auth.meta.com in your normal browser, then /login")
-        print("    2) instant: /cookie <meta_session value>  (from any logged-in vibes.ai browser)")
+            C = None
+            print("[.] saved session rejected")
+            _auto_login()            # self-heal right away
     else:
-        try:
-            auth.save_session(C.s)   # keep file + embedded copy fresh
-        except Exception:
-            pass
+        print("[.] no session found yet")
+        _auto_login()                # self-heal right away
     print("> type a prompt → generate videos (auto-save to vibes/media/)")
     print("> /help  /projects  /media  /voices  /img  /v  /ref /  /upload  /dl  /dup…")
     while True:
@@ -1506,17 +1555,30 @@ def repl():
         else:
             op, arg = raw, ""          # plain text = prompt → video
         if op not in ("/login", "/cookie", "/quit", "/exit", "/help") and C is None:
-            print("[!] /login first (or /cookie <value>)")
-            continue
-        try:
-            if op.startswith("/"):
-                dispatch(op, arg)
-            else:
-                gen(raw)
-        except VibesError as e:
-            print("[!]", e)
-        except Exception as e:
-            print("[!]", type(e).__name__, e)
+            if not _auto_login():      # try regenerating before giving up
+                print("[!] still no session — /cookie <value> or /login")
+                continue
+        done = False
+        for attempt in range(2):       # one automatic recovery retry on 401
+            try:
+                if op.startswith("/"):
+                    dispatch(op, arg)
+                else:
+                    gen(raw)
+                done = True
+                break
+            except VibesError as e:
+                print("[!]", e)
+                if getattr(e, "status", None) == 401 and attempt == 0:
+                    C = None
+                    if _auto_login():
+                        continue       # session regenerated → retry the command
+                done = True
+                break
+            except Exception as e:
+                print("[!]", type(e).__name__, e)
+                done = True
+                break
 
 
 if __name__ == "__main__":

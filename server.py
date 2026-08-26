@@ -22,6 +22,7 @@ so Render's free disk can never fill up.
 import asyncio
 import base64
 import glob
+import json
 import os
 import tempfile
 import threading
@@ -159,22 +160,87 @@ _vibes_lock = threading.Lock()
 _vibes_client = None
 
 
+def _session_cookie_candidates():
+    """All distinct meta_session values available (env, file, embedded)."""
+    vals = []
+    env = os.environ.get("VIBES_SESSION", "").strip()
+    if env:
+        vals.append(env)
+    sf = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "session.json")
+    try:
+        data = json.load(open(sf, encoding="utf-8"))
+        for c in data.get("cookies", []):
+            if c.get("name") == "meta_session":
+                v = c.get("value")
+                if v:
+                    vals.append(v)
+        if data.get("meta_session"):
+            vals.append(data["meta_session"])
+    except Exception:  # noqa: BLE001
+        pass
+    raw = getattr(vibes_mod, "_SESSION_PAYLOAD", "")
+    import re as _re
+    m = _re.search(r"#_SP_BEGIN\s*(.*?)\s*#_SP_END", raw, _re.S) or \
+        (_re.search(r"\{.*\}", raw, _re.S))
+    if m:
+        try:
+            j = json.loads(m.group(1) if "#_SP_BEGIN" in raw else m.group(0))
+            for c in j.get("cookies", []):
+                if c.get("name") == "meta_session":
+                    v = c.get("value")
+                    if v:
+                        vals.append(v)
+            if j.get("meta_session"):
+                vals.append(j["meta_session"])
+        except Exception:  # noqa: BLE001
+            pass
+    seen = set()
+    out = []
+    for v in vals:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _try_vibes_cookie(value):
+    from curl_cffi import requests as _rq
+    s = _rq.Session(impersonate="chrome")
+    s.cookies.set("meta_session", value, domain=".vibes.ai", path="/")
+    s.cookies.set("cookie_ack", "true", domain=".vibes.ai", path="/")
+    return s
+
+
 def _get_vibes():
     global _vibes_client
     with _vibes_lock:
         if _vibes_client is not None:
             return _vibes_client
+        last_err = None
+        # 1) standard loader first (keeps extra auth cookies when valid)
         s = vibes_mod.auth.load_session()
-        if s is None:
-            s = vibes_mod.auth.login_session(
-                print_fn=lambda *a: print("[vibes-auth]", *a))
-            if s is not None:
-                vibes_mod.auth.save_session(s)
-        if s is None:
-            raise RuntimeError("vibes.ai authentication failed "
-                               "(session.json invalid and re-login rejected)")
-        _vibes_client = vibes_mod.Vibes(s)
-        return _vibes_client
+        if s is not None:
+            try:
+                vibes_mod.Vibes(s).me()
+                _vibes_client = vibes_mod.Vibes(s)
+                return _vibes_client
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+        # 2) try each individual meta_session cookie until one authenticates
+        for val in _session_cookie_candidates():
+            try:
+                cand = _try_vibes_cookie(val)
+                u = vibes_mod.Vibes(cand).me()
+                print(f"[vibes] working session restored ({u.get('username')})")
+                _vibes_client = vibes_mod.Vibes(cand)
+                vibes_mod.auth.save_session(_vibes_client.s)
+                return _vibes_client
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        raise RuntimeError(f"no working vibes.ai session "
+                           f"({str(last_err)[:120]})")
 
 
 def _reset_vibes():
@@ -921,6 +987,43 @@ async def api_job(job_id: str):
         out["error"] = rec["result"].get("error")
     return JSONResponse(out)
 
+
+import mimetypes as _mimetypes
+from fastapi.responses import StreamingResponse
+
+_DL_HOST_OK = ("fbcdn.net", "vibes.ai", "meta.ai", "cdninstagram.com")
+
+
+@app.get("/api/download")
+async def api_download(url: str):
+    """Proxy-download generated media with attachment headers, so the browser
+    saves the file instead of navigating to the CDN link."""
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in _DL_HOST_OK):
+        return JSONResponse({"error": "host not allowed"}, status_code=400)
+    try:
+        from curl_cffi import requests as _rq
+        r = _rq.get(url, timeout=300, impersonate="chrome")
+        if r.status_code != 200:
+            return JSONResponse({"error": f"fetch failed "
+                                          f"({r.status_code})"},
+                                status_code=502)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+    ctype = (r.headers.get("content-type") or "application/octet-stream"
+             ).split(";")[0].strip()
+    ext = _mimetypes.guess_extension(ctype) or ""
+    base = os.path.basename(urlparse(url).path) or "media"
+    if ext and not base.lower().endswith(ext):
+        base += ext
+    from io import BytesIO
+    return StreamingResponse(
+        BytesIO(r.content),
+        media_type=ctype,
+        headers={"Content-Disposition": f'attachment; filename="{base}"',
+                 "Content-Length": str(len(r.content))})
+
 # ── web app ───────────────────────────────────────────────────────────────
 
 _APP_HTML = """<!DOCTYPE html>
@@ -993,10 +1096,10 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
 });
 const $=id=>document.getElementById(id);
 function addImg(u){const d=document.createElement('div');
-  d.innerHTML=`<img src="${u}"><a class="dl" href="${u}" target="_blank" download>Download</a>`;
+  d.innerHTML=`<img src="${u}"><a class="dl" href="/api/download?url=${encodeURIComponent(u)}" download>Download</a>`;
   $('grid').prepend(d);}
 function addVid(u){const d=document.createElement('div');
-  d.innerHTML=`<video src="${u}" controls muted playsinline></video><a class="dl" href="${u}" target="_blank" download>Download</a>`;
+  d.innerHTML=`<video src="${u}" controls muted playsinline></video><a class="dl" href="/api/download?url=${encodeURIComponent(u)}" download>Download</a>`;
   $('grid').prepend(d);}
 async function poll(jid){const r=await fetch('/api/job/'+jid);
   const j=await r.json();
