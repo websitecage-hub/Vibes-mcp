@@ -962,6 +962,9 @@ async def api_image(req: Request):
             return JSONResponse({"error": "prompt required"}, status_code=400)
         res = await meta_ask("/imagine " + prompt, timeout=180)
         urls = [m["url"] for m in res["media"] if m.get("url")]
+        if not urls:
+            msg = (res.get("text") or "").strip() or "No image returned — try rephrasing the prompt."
+            return JSONResponse({"urls": [], "error": msg[:600]})
         return JSONResponse({"urls": urls})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"error": str(e)[:300]}, status_code=500)
@@ -1129,7 +1132,9 @@ $('go').onclick=async()=>{
     if(MODE==='image'){
       const r=await fetch('/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p})});
       const j=await r.json();$('go').disabled=false;
+      if(j.error&&(!j.urls||j.urls.length===0)){$('msg').textContent=j.error;$('msg').className='err';return;}
       if(j.error){$('msg').textContent=j.error;$('msg').className='err';return;}
+      if(!j.urls||j.urls.length===0){$('msg').textContent='No image returned — try rephrasing.';$('msg').className='err';return;}
       $('msg').textContent='Done!';j.urls.forEach(addImg);
     }else{
       const body={prompt:p,aspect_ratio:$('aspect').value,resolution:$('res').value};
