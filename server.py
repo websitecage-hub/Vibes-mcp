@@ -1243,6 +1243,9 @@ function renderProjBar(){
     });
   } else $('hist').style.display='none';
   $('refurl').style.display=MODE==='animate'?'block':'none';
+  $('res').style.display = MODE==='image'?'none':'block';
+  $('model').style.display = MODE==='image'?'none':'block';
+  $('count').style.display = MODE==='image'?'none':'block';
 }
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
