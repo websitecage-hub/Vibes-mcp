@@ -306,7 +306,7 @@ def _vibes_with_fresh_login(fn, *args, **kw):
 
 
 def _run_vibe_gen(prompt, aspect, resolution, model, n, max_sec,
-                  reference_image_url=None, gen_kind="auto"):
+                  reference_image_url=None, gen_type="t2v", hub_project_id=None, *_, **__):
     v = _get_vibes()
     tmp = None
     try:
