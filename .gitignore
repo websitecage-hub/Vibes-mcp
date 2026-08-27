@@ -8,3 +8,8 @@ media/
 downloads/
 .vibe/
 .env
+app.log
+vibes.log
+*.log
+.venv/
+app.log

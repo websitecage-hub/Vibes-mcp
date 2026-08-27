@@ -12,13 +12,121 @@ Token priority: env META_TOKEN -> ./token.txt -> embedded fallback.
 import re, time, uuid, base64, os, json, sys, random, threading, asyncio, io
 from datetime import datetime
 from urllib.parse import parse_qs, quote
-from curl_cffi import requests
-from nacl.public import SealedBox, PublicKey
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+try:
+    from curl_cffi import requests
+    from nacl.public import SealedBox, PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    import websockets
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+    from google.protobuf import json_format
+except ImportError as _e:
+    _miss = str(_e).split("'")[1] if "'" in str(_e) else str(_e)
+    print(f"[!] Missing dependency: {_e}")
+    print(f"    Install all with: pip install curl_cffi websockets protobuf PyNaCl cryptography")
+    print(f"    Or: pip install -r requirements.txt")
+    # try auto-install
+    try:
+        import subprocess
+        print("[*] Attempting auto-install...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "curl_cffi", "websockets", "protobuf", "PyNaCl", "cryptography", "--quiet"])
+        print("[+] Auto-install done, please rerun the script")
+    except Exception as _ae:
+        print(f"[!] Auto-install failed: {_ae}")
+    sys.exit(1)
 
 # fix Windows stdout encoding (moved into __main__, see CLI below)
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── reliability: logging, validation, safe I/O ──────────────────────────
+import logging, traceback, hashlib, pathlib
+LOG_FILE = os.path.join(ROOT_DIR, "app.log")
+try:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)])
+except Exception:
+    logging.basicConfig(level=logging.INFO)
+LOOG = logging.getLogger("meta")
+def _safe_write(path, data_bytes):
+    """Atomic write: write to temp then rename, never leaves half-file."""
+    try:
+        tmp = path + ".tmp"
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(data_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        LOOG.warning(f"safe_write failed {path}: {e}")
+        try:
+            with open(path, "wb") as f:
+                f.write(data_bytes)
+            return True
+        except Exception as e2:
+            LOOG.error(f"fallback write failed {path}: {e2}")
+            return False
+def _validate_temperature(v):
+    try:
+        f = float(v)
+        if not 0 <= f <= 2.5:
+            raise ValueError(f"temperature {f} out of range 0-2.5, clamping")
+        return max(0.0, min(2.5, f))
+    except Exception as e:
+        LOOG.warning(f"temperature validation {v}: {e}")
+        return None
+def _validate_top_p(v):
+    try:
+        f = float(v)
+        return max(0.01, min(1.0, f))
+    except Exception:
+        return None
+def _validate_max_tokens(v):
+    try:
+        i = int(v)
+        return max(1, min(8192, i))
+    except Exception:
+        return None
+def _validate_locale(v):
+    if not v or not isinstance(v, str):
+        return "en-US"
+    v = v.strip()
+    if "-" not in v and "_" not in v:
+        return "en-US"
+    return v[:20]
+def _validate_timezone(v):
+    if not v or not isinstance(v, str):
+        return "Asia/Calcutta"
+    return v[:40]
+def _validate_file(path, max_mb=200):
+    if not path or not isinstance(path, str):
+        raise ValueError("file path required")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"file not found: {path}")
+    if not os.path.isfile(path):
+        raise ValueError(f"not a file: {path}")
+    sz = os.path.getsize(path)
+    if sz == 0:
+        raise ValueError("file is empty")
+    if sz > max_mb * 1024 * 1024:
+        raise ValueError(f"file {sz} bytes exceeds {max_mb} MB limit")
+    return path
+def _retry_with_backoff(fn, retries=3, base_delay=0.8, max_delay=8, exceptions=(Exception,)):
+    """Generic retry with exponential backoff, returns result or raises last."""
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except exceptions as e:
+            last = e
+            if attempt >= retries:
+                break
+            delay = min(base_delay * (2 ** attempt) + random.random(), max_delay)
+            LOOG.warning(f"retry {attempt+1}/{retries} after {type(e).__name__}: {e} — sleep {delay:.1f}s")
+            time.sleep(delay)
+    raise last
 
 # ── embedded files (materialize once into ./_rt) ────────────────────────
 _PAYLOADS = {
@@ -47,37 +155,82 @@ _EMBED_MARKERS = {
 }
 
 def _update_embedded(name, data_bytes):
-    """Rewrite an embedded payload block inside THIS file (best effort).
-    Keeps the newest working token / session travelling with the script."""
+    """Rewrite an embedded payload block inside THIS file (best effort, atomic)."""
     try:
+        if not isinstance(data_bytes, (bytes, bytearray)):
+            LOOG.warning(f"_update_embedded {name}: not bytes")
+            return False
+        if len(data_bytes) == 0:
+            LOOG.warning(f"_update_embedded {name}: empty data")
+            return False
         beg, end = _EMBED_MARKERS[name]
         path = os.path.abspath(__file__)
-        with open(path, "r", encoding="utf-8") as f:
-            src = f.read()
+        try:
+            src = pathlib.Path(path).read_text(encoding="utf-8")
+        except Exception as e:
+            LOOG.error(f"_update_embedded read {path}: {e}")
+            return False
         i = src.find(beg)
         j = src.find(end, i)
         if i == -1 or j == -1:
+            LOOG.warning(f"_update_embedded markers not found for {name}")
             return False
         b64 = base64.b64encode(data_bytes).decode()
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(src[:i] + beg + "\n" + b64 + "\n" + src[j:])
+        new_src = src[:i] + beg + "\n" + b64 + "\n" + src[j:]
+        if not _safe_write(path, new_src.encode("utf-8")):
+            return False
         _PAYLOADS[name] = beg + "\n" + b64 + "\n" + end
+        LOOG.info(f"_update_embedded {name} ok ({len(data_bytes)} bytes)")
         return True
-    except Exception:
+    except Exception as e:
+        LOOG.error(f"_update_embedded {name} failed: {e}\n{traceback.format_exc()}")
         return False
 
 def _bootstrap():
-    _rt = os.path.join(ROOT_DIR, "_rt")
-    os.makedirs(_rt, exist_ok=True)
-    for name in _PAYLOADS:
-        dst = (os.path.join(ROOT_DIR, name) if name == "meta_session.json"
-               else os.path.join(_rt, name))
-        if not os.path.exists(dst) or os.path.getsize(dst) < 32:
+    try:
+        _rt = os.path.join(ROOT_DIR, "_rt")
+        try:
+            os.makedirs(_rt, exist_ok=True)
+        except Exception as e:
+            LOOG.error(f"_bootstrap mkdir {_rt}: {e}")
+        for name in list(_PAYLOADS.keys()):
             try:
-                open(dst, "wb").write(base64.b64decode(_payload_b64(name)))
-            except Exception as e:  # noqa: BLE001
-                print(f"[!] failed to materialize {name}: {e}")
-    sys.path.insert(0, _rt)
+                dst = (os.path.join(ROOT_DIR, name) if name == "meta_session.json"
+                       else os.path.join(_rt, name))
+                needs = False
+                try:
+                    if not os.path.exists(dst) or os.path.getsize(dst) < 32:
+                        needs = True
+                    else:
+                        # validate proto files are readable
+                        if name.endswith(".proto"):
+                            open(dst, "rb").read(10)
+                except Exception:
+                    needs = True
+                if needs:
+                    b64 = _payload_b64(name)
+                    if not b64:
+                        LOOG.warning(f"_bootstrap {name}: empty payload")
+                        continue
+                    try:
+                        data = base64.b64decode(b64.encode())
+                    except Exception as e:
+                        LOOG.error(f"_bootstrap {name} b64 decode: {e}")
+                        continue
+                    if not _safe_write(dst, data):
+                        LOOG.error(f"_bootstrap failed to write {dst}")
+                    else:
+                        LOOG.info(f"_bootstrap materialized {name} ({len(data)} bytes)")
+            except Exception as e:
+                LOOG.error(f"_bootstrap {name}: {e}\n{traceback.format_exc()}")
+        if _rt not in sys.path:
+            sys.path.insert(0, _rt)
+    except Exception as e:
+        LOOG.error(f"_bootstrap fatal: {e}\n{traceback.format_exc()}")
+        try:
+            if os.path.join(ROOT_DIR, "_rt") not in sys.path:
+                sys.path.insert(0, os.path.join(ROOT_DIR, "_rt"))
+        except: pass
 
 _bootstrap()
 
@@ -93,34 +246,55 @@ for _m in ("dgw_client", "dgw_session"):
     sys.modules[_m] = _ModuleProxy(_m)
 
 def load_token():
-    """Token priority: env META_TOKEN -> ./token.txt -> embedded fallback."""
-    t = os.environ.get("META_TOKEN", "").strip()
-    if t:
-        return t
-    tf = os.path.join(ROOT_DIR, "token.txt")
-    if os.path.exists(tf):
-        t = open(tf, encoding="utf-8").read().strip()
+    """Token priority: env META_TOKEN -> ./token.txt -> embedded fallback. Validates format."""
+    try:
+        t = os.environ.get("META_TOKEN", "").strip()
         if t:
-            return t
-    b64 = _payload_b64("token.txt")
-    if b64:
-        try:
-            return base64.b64decode(b64.encode()).decode("utf-8").strip()
-        except Exception:  # noqa: BLE001
-            pass
+            if ":" in t and len(t) > 20:
+                return t
+            elif len(t) > 20:
+                return t
+        tf = os.path.join(ROOT_DIR, "token.txt")
+        if os.path.exists(tf):
+            try:
+                t = pathlib.Path(tf).read_text(encoding="utf-8").strip()
+                if t and len(t) > 20:
+                    # basic format check
+                    if t.startswith("ecto1:") or len(t) > 30:
+                        return t
+            except Exception as e:
+                LOOG.warning(f"load_token read {tf}: {e}")
+        b64 = _payload_b64("token.txt")
+        if b64:
+            try:
+                decoded = base64.b64decode(b64.encode()).decode("utf-8").strip()
+                if decoded and len(decoded) > 20:
+                    return decoded
+            except Exception as e:
+                LOOG.warning(f"load_token b64 decode: {e}")
+    except Exception as e:
+        LOOG.error(f"load_token: {e}")
     return ""
 
 def save_token(t):
-    """Persist a fresh DGW token: ./token.txt + embedded copy in this file."""
-    t = (t or "").strip()
-    if not t:
-        return False
+    """Persist a fresh DGW token: ./token.txt + embedded copy (atomic, validated)."""
     try:
-        open(os.path.join(ROOT_DIR, "token.txt"), "w",
-             encoding="utf-8").write(t)
-    except Exception:
-        pass
-    return _update_embedded("token.txt", t.encode("utf-8"))
+        t = (t or "").strip()
+        if not t or len(t) < 20:
+            LOOG.warning(f"save_token: invalid token len {len(t)}")
+            return False
+        # validate it looks like ecto1:
+        if not t.startswith("ecto1:") and ":" not in t and len(t) < 30:
+            LOOG.warning("save_token: token does not look like ecto1")
+        ok_file = _safe_write(os.path.join(ROOT_DIR, "token.txt"), t.encode("utf-8"))
+        ok_embed = _update_embedded("token.txt", t.encode("utf-8"))
+        if ok_file or ok_embed:
+            LOOG.info("save_token ok")
+            return True
+        return False
+    except Exception as e:
+        LOOG.error(f"save_token: {e}\n{traceback.format_exc()}")
+        return False
 
 
 
@@ -176,59 +350,146 @@ def attachment_type_for(mime):
     return 2
 
 def upload_file(path, token, timeout=120):
-    """rupload a local file (mirrors browser flow) -> media_id (int)."""
-    from curl_cffi import requests as cffi_requests
-    import hashlib, mimetypes
-    data = open(path, "rb").read()
-    fname = os.path.basename(path)
-    mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
-    auth = token if token.startswith("ecto1:") else "ecto1:" + token
-    digest = "sha256 " + base64.b64encode(hashlib.sha256(data).digest()).decode()
-    url = f"https://rupload.meta.ai/gen_ai_document_gen_ai_tenant/{uuid.uuid4()}"
-    base = {
-        "authorization": "OAuth " + auth,
-        "desired_upload_handler": "genai_document",
-        "ecto_auth_token": "true",
-        "is_abra_user": "true",
-        "x-entity-length": str(len(data)),
-        "referer": "https://www.meta.ai/",
-        "origin": "https://www.meta.ai",
-        "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
-    }
-    s = cffi_requests.Session(impersonate="chrome")
-    get_h = dict(base, **{"x-entity-digest": digest})
-    r = s.get(url, headers=get_h, timeout=timeout)
-    offset = "0"
+    """rupload a local file (mirrors browser flow) -> media_id (int). Hardened: validates, retries, logs."""
     try:
-        offset = str(r.json().get("offset", "0"))
-    except Exception:
-        pass
-    post_h = dict(base, **{
-        "offset": offset, "x-entity-type": mime, "x-entity-name": fname,
-        "content-type": "application/octet-stream",
-    })
-    r = s.post(url, data=data, headers=post_h, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(f"rupload failed {r.status_code}: {r.text[:200]}")
-    j = r.json()
-    mid = j.get("media_id") or j.get("mediaId")
-    if mid is None:
-        raise RuntimeError(f"rupload: no media_id in {j}")
-    return int(mid)
+        # validate inputs
+        _validate_file(path, max_mb=200)
+        if not token or not isinstance(token, str) or len(token.strip()) < 20:
+            raise ValueError("invalid token for upload")
+        token = token.strip()
+    except Exception as e:
+        LOOG.error(f"upload_file validation: {e}")
+        raise
+    def _do_upload():
+        from curl_cffi import requests as cffi_requests
+        import hashlib, mimetypes
+        data = pathlib.Path(path).read_bytes()
+        fname = os.path.basename(path)
+        mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        auth = token if token.startswith("ecto1:") else "ecto1:" + token
+        digest = "sha256 " + base64.b64encode(hashlib.sha256(data).digest()).decode()
+        url = f"https://rupload.meta.ai/gen_ai_document_gen_ai_tenant/{uuid.uuid4()}"
+        base = {
+            "authorization": "OAuth " + auth,
+            "desired_upload_handler": "genai_document",
+            "ecto_auth_token": "true",
+            "is_abra_user": "true",
+            "x-entity-length": str(len(data)),
+            "referer": "https://www.meta.ai/",
+            "origin": "https://www.meta.ai",
+            "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
+        }
+        s = cffi_requests.Session(impersonate="chrome")
+        get_h = dict(base, **{"x-entity-digest": digest})
+        r = s.get(url, headers=get_h, timeout=timeout)
+        if r.status_code not in (200, 201, 204):
+            raise RuntimeError(f"rupload GET failed {r.status_code}: {r.text[:300]}")
+        offset = "0"
+        try:
+            offset = str(r.json().get("offset", "0"))
+        except Exception:
+            pass
+        post_h = dict(base, **{
+            "offset": offset, "x-entity-type": mime, "x-entity-name": fname,
+            "content-type": "application/octet-stream",
+        })
+        r = s.post(url, data=data, headers=post_h, timeout=timeout)
+        if r.status_code != 200:
+            raise RuntimeError(f"rupload POST failed {r.status_code}: {r.text[:500]}")
+        j = r.json()
+        mid = j.get("media_id") or j.get("mediaId")
+        if mid is None:
+            raise RuntimeError(f"rupload: no media_id in {j}")
+        return int(mid)
+    return _retry_with_backoff(_do_upload, retries=2, base_delay=1.5)
 
-def build_request(conversation_id, message, request_id, mode="instant", attachments=None):
+def build_request(conversation_id, message, request_id, mode="instant", attachments=None, persona_id=None, project_id=None, conversation_starter_id=None, temperature=None, top_p=None, max_tokens=None, thinking_level=None, reasoning_effort=None, model=None, system_prompt=None, skill_ids=None, search_enabled=None, locale="en-US", timezone="Asia/Calcutta", reply_to=None, branch_path="0", imagine=None):
     """Build the ecto Request proto mirroring the browser's captured request.
-    attachments: list of dicts {path|media_id, mime_type, filename}.
+    attachments: list of dicts {media_id, mime_type, filename, type}.
+    Extended Web-UI coverage:
+      persona_id, project_id, temperature/top_p/max_tokens, thinking_level (STANDARD/EXTENDED), reasoning_effort (LOW/MEDIUM/HIGH), model, system_prompt, skill_ids, search_enabled, locale/timezone, reply_to (messageId to reply), branch_path, imagine={operation, params}
     Uses conversation_id as promptSessionId/clientThreadId so the same socket
     keeps per-conversation memory (pass another id to start fresh)."""
+    # validate core inputs
+    try:
+        if not conversation_id or not isinstance(conversation_id, str) or len(conversation_id) < 8:
+            raise ValueError("conversation_id must be uuid string")
+        if not message or not isinstance(message, str):
+            raise ValueError("message must be non-empty string")
+        if len(message) > 50000:
+            LOOG.warning(f"message len {len(message)} truncated to 50000")
+            message = message[:50000]
+        if not request_id or not isinstance(request_id, str):
+            request_id = str(uuid.uuid4())
+        # validate opts via helpers
+        if temperature is not None:
+            temperature = _validate_temperature(temperature)
+        if top_p is not None:
+            top_p = _validate_top_p(top_p)
+        if max_tokens is not None:
+            max_tokens = _validate_max_tokens(max_tokens)
+        if locale:
+            locale = _validate_locale(locale)
+        if timezone:
+            timezone = _validate_timezone(timezone)
+        if attachments:
+            if not isinstance(attachments, list):
+                raise ValueError("attachments must be list")
+            for a in attachments:
+                if not isinstance(a, dict) or "media_id" not in a:
+                    raise ValueError(f"invalid attachment {a}")
+    except ValueError as ve:
+        LOOG.error(f"build_request validation: {ve}")
+        raise
+    except Exception as e:
+        LOOG.error(f"build_request validation unexpected: {e}")
+        raise ValueError(f"invalid build_request inputs: {e}")
+
     now_ms = str(int(time.time() * 1000))
     unique_msg_id = str((int(now_ms) << 22) | random.getrandbits(22))
 
     m = MODES.get(mode, MODES["instant"])
     model_overrides = {"thinkingEnabled": False}
     if m["thinking"]:
-        model_overrides = {"thinkingEnabled": True, "thinkingLevel": "THINKING_LEVEL_STANDARD"}
+        lvl = thinking_level or "THINKING_LEVEL_STANDARD"
+        # allow short names: standard/extended
+        if lvl.upper() in ("STANDARD", "EXTENDED"):
+            lvl = "THINKING_LEVEL_" + lvl.upper()
+        model_overrides = {"thinkingEnabled": True, "thinkingLevel": lvl}
+    # reasoning_effort overrides thinking if provided
+    if reasoning_effort:
+        re_map = {"NONE":0, "MINIMAL":1, "LOW":2, "MEDIUM":3, "HIGH":4, "XHIGH":5}
+        # store as string enum name
+        re_name = "REASONING_EFFORT_" + reasoning_effort.upper()
+        model_overrides["reasoningEffort"] = re_name
+    if temperature is not None:
+        model_overrides["temperature"] = float(temperature)
+    if top_p is not None:
+        model_overrides["topP"] = float(top_p)
+    if max_tokens is not None:
+        model_overrides["maxTokens"] = int(max_tokens)
+    if model:
+        model_overrides["model"] = model
+    if system_prompt:
+        model_overrides["systemPromptTemplate"] = system_prompt
+    if skill_ids:
+        model_overrides["skillIds"] = skill_ids if isinstance(skill_ids, list) else [skill_ids]
+    # clippy overrides for search/tools
+    clippy_overrides = {"writesEnabledViaNodeApiForCp": True}
+    if search_enabled is not None:
+        # web UI toggle: enable/disable meta search — maps to isMetasearchInlineEnabled / web_search_overrides
+        clippy_overrides["isMetasearchInlineEnabled"] = bool(search_enabled)
+        clippy_overrides["metaSearchOverride"] = "" if search_enabled else "disabled"
+    # persona override
+    persona_block = {"personaId": persona_id or "867051314767696", "personaVersion": persona_id or "867051314767696"}
+    # productData with optional project/conversation_starter
+    meta_product_data = {"conversationId": conversation_id}
+    if project_id:
+        meta_product_data["projectId"] = project_id
+        meta_product_data["projectDetails"] = {"projectId": project_id}
+    if conversation_starter_id:
+        meta_product_data["conversationStarterId"] = conversation_starter_id
 
     data = {
         "metadata": {
@@ -237,12 +498,11 @@ def build_request(conversation_id, message, request_id, mode="instant", attachme
                 "appId": "1522763855472543",
                 "configKey": "5a5b-8d4e-f054-99ef-b2de-db02-0d05-52c7",
                 "productData": {
-                    "metaAiProductData": {"conversationId": conversation_id}
+                    "metaAiProductData": meta_product_data
                 },
                 "appType": "APP_TYPE_ECTO_1",
                 "botChatType": "HUMAN_AGENT",
-                "persona": {"personaId": "867051314767696",
-                            "personaVersion": "867051314767696"},
+                "persona": persona_block,
                 "appName": "ECTO1",
                 "clientName": "Abra Web Main Key",
                 "productConfig": {
@@ -273,14 +533,14 @@ def build_request(conversation_id, message, request_id, mode="instant", attachme
             },
             "requestId": request_id,
             "modelInputOverrides": model_overrides,
-            "localeInfo": {"userLocale": "en-US"},
+            "localeInfo": {"userLocale": locale},
             "conversationContextIds": {
                 "promptSessionId": conversation_id,
                 "qplJoinId": str(uuid.uuid4()),
                 "clientThreadId": conversation_id
             },
-            "locationData": {"clientTimezone": "Asia/Calcutta"},
-            "clippyOverrides": {"writesEnabledViaNodeApiForCp": True},
+            "locationData": {"clientTimezone": timezone},
+            "clippyOverrides": clippy_overrides,
             "inlineCapabilities": {
                 "stocks": {"version": 1},
                 "weather": {"version": 1},
@@ -302,9 +562,25 @@ def build_request(conversation_id, message, request_id, mode="instant", attachme
                 "isNewConversation": True
             },
             "content": message,
-            "promptEditConfig": {"currentBranchPath": "0"}
+            "promptEditConfig": {"currentBranchPath": branch_path}
         }
     }
+    # reply context (web UI: reply to a specific assistant message)
+    if reply_to:
+        data["prompt"]["promptId"]["repliedToUniqueMessageId"] = int(reply_to) if str(reply_to).isdigit() else int(int(reply_to) if reply_to else 0)
+        # also set reply context in productData if provided as dict with keys
+        if isinstance(reply_to, dict):
+            data["metadata"]["productContext"]["productData"]["metaAiProductData"]["responseReplyContext"] = reply_to
+    # imagine / media generation via dedicated proto fields (web UI: /imagine and image edit)
+    if imagine:
+        # imagine = {"operation": "IMAGINE_OPERATION_TEXT_TO_IMAGE", "params": {"prompt": "...", "num_media": 1, "orientation": "square", ...}}
+        op = imagine.get("operation", "IMAGINE_OPERATION_TEXT_TO_IMAGE")
+        # map string to enum; proto expects numeric or string via json_format
+        data["imagine_operation"] = op
+        if "params" in imagine:
+            data["imagine_params"] = imagine["params"]
+        if "request_id" in imagine:
+            data["imagine_request_id"] = imagine["request_id"]
     if attachments:
         atts = []
         for a in attachments:
@@ -346,80 +622,109 @@ def parse_recv_frame(data):
     return ftype, sid, body, body  # flags+payload both in body; caller slices
 
 def download_media_items(media, out_dir=None):
-    """Download media URLs using session cookies. Returns list with 'saved' paths."""
+    """Download media URLs using session cookies. Returns list with 'saved' paths. Hardened with retries, validation, atomic writes."""
+    if not isinstance(media, list):
+        LOOG.warning(f"download_media_items: media not list {type(media)}")
+        return []
     if out_dir is None:
-        out_dir = os.path.join(ROOT, "downloads")
-    os.makedirs(out_dir, exist_ok=True)
+        out_dir = os.path.join(ROOT_DIR, "downloads")
     try:
-        from curl_cffi import requests as cffi_requests
-    except ImportError:
-        print("[!] curl_cffi not available, cannot download media")
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:
+        LOOG.error(f"download_media_items mkdir {out_dir}: {e}")
         return media
     try:
-        cookies = json.load(open(os.path.join(ROOT, "meta_session.json")))
-        ck = {c["name"]: c["value"] for c in cookies}
+        from curl_cffi import requests as cffi_requests
+    except ImportError as e:
+        LOOG.error(f"curl_cffi not available: {e}")
+        return media
+    try:
+        cookies = json.loads(pathlib.Path(os.path.join(ROOT_DIR, "meta_session.json")).read_text(encoding="utf-8"))
+        ck = {c["name"]: c["value"] for c in cookies if c.get("name") and c.get("value")}
     except Exception as e:
-        print(f"[!] no cookies for download: {e}")
+        LOOG.warning(f"no cookies for download: {e}")
         ck = {}
     s = cffi_requests.Session(impersonate="chrome")
-    s.cookies.update(ck)
-    for m in media:
-        url = m.get("url")
-        if not url or not url.startswith("http"):
-            m["saved"] = None
-            continue
+    try:
+        s.cookies.update(ck)
+    except Exception as e:
+        LOOG.warning(f"cookie update: {e}")
+    for m in list(media):
         try:
-            r = s.get(url, timeout=90)
-            if r.status_code == 200:
-                fname = os.path.basename(m.get("filename") or "") or "media"
-                if not fname or fname == "media" or "/" in fname or "\\" in fname:
-                    fname = "media_" + str(abs(hash(url)))[:10]
-                    ext = {
-                        "image/webp": ".webp", "image/jpeg": ".jpg", "image/png": ".png",
-                        "image/gif": ".gif", "image/svg+xml": ".svg", "image/bmp": ".bmp",
-                        "image/tiff": ".tiff", "image/x-icon": ".ico", "image/heic": ".heic",
-                        "image/avif": ".avif",
-                        "video/mp4": ".mp4", "video/webm": ".webm", "video/x-matroska": ".mkv",
-                        "video/quicktime": ".mov", "video/mpeg": ".mpg", "video/x-msvideo": ".avi",
-                        "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/wav": ".wav",
-                        "audio/ogg": ".ogg", "audio/aac": ".aac", "audio/flac": ".flac",
-                        "audio/webm": ".weba",
-                        "text/plain": ".txt", "text/csv": ".csv", "text/x-srt": ".srt",
-                        "application/x-subrip": ".srt", "text/vtt": ".vtt",
-                        "text/html": ".html", "text/markdown": ".md", "text/xml": ".xml",
-                        "application/json": ".json", "application/xml": ".xml",
-                        "application/yaml": ".yaml", "application/javascript": ".js",
-                        "application/pdf": ".pdf", "application/zip": ".zip",
-                        "application/gzip": ".gz", "application/x-tar": ".tar",
-                        "application/epub+zip": ".epub", "application/rtf": ".rtf",
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-                        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-                        "application/msword": ".doc", "application/vnd.ms-excel": ".xls",
-                    }.get(m.get("mime_type"), "")
-                    fname += ext
-                fname = os.path.basename(fname.replace("\\", "/"))
-                fp = os.path.join(out_dir, fname)
-                open(fp, "wb").write(r.content)
-                m["saved"] = fp
-                m["size"] = len(r.content)
-                if m.get("mime_type", "").lower() in (
-                        "text/plain", "text/csv", "text/html", "text/markdown",
-                        "text/vtt", "application/x-subrip", "text/x-srt",
-                        "application/json", "application/xml", "application/rtf"):
-                    if len(r.content) < 300_000:
-                        try:
-                            m["preview"] = r.content.decode("utf-8", "replace")
-                        except Exception:
-                            pass
-                print(f"[*] saved {fp} ({len(r.content)} bytes)")
-            else:
+            if not isinstance(m, dict):
+                continue
+            url = m.get("url")
+            if not url or not isinstance(url, str) or not url.startswith("http"):
                 m["saved"] = None
-                print(f"[!] download failed status {r.status_code}")
+                continue
+            # retry download up to 3 times
+            def _dl():
+                r = s.get(url, timeout=90)
+                if r.status_code != 200:
+                    raise RuntimeError(f"download status {r.status_code}")
+                if not r.content or len(r.content) == 0:
+                    raise RuntimeError("empty content")
+                return r.content
+            try:
+                content = _retry_with_backoff(_dl, retries=2, base_delay=1.0)
+            except Exception as e:
+                LOOG.warning(f"download failed {url[:60]}: {e}")
+                m["saved"] = None
+                continue
+            fname = os.path.basename(m.get("filename") or "") or "media"
+            if not fname or fname == "media" or "/" in fname or "\\" in fname:
+                fname = "media_" + str(abs(hash(url)))[:10]
+                ext = {
+                    "image/webp": ".webp", "image/jpeg": ".jpg", "image/png": ".png",
+                    "image/gif": ".gif", "image/svg+xml": ".svg", "image/bmp": ".bmp",
+                    "image/tiff": ".tiff", "image/x-icon": ".ico", "image/heic": ".heic",
+                    "image/avif": ".avif",
+                    "video/mp4": ".mp4", "video/webm": ".webm", "video/x-matroska": ".mkv",
+                    "video/quicktime": ".mov", "video/mpeg": ".mpg", "video/x-msvideo": ".avi",
+                    "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/wav": ".wav",
+                    "audio/ogg": ".ogg", "audio/aac": ".aac", "audio/flac": ".flac",
+                    "audio/webm": ".weba",
+                    "text/plain": ".txt", "text/csv": ".csv", "text/x-srt": ".srt",
+                    "application/x-subrip": ".srt", "text/vtt": ".vtt",
+                    "text/html": ".html", "text/markdown": ".md", "text/xml": ".xml",
+                    "application/json": ".json", "application/xml": ".xml",
+                    "application/yaml": ".yaml", "application/javascript": ".js",
+                    "application/pdf": ".pdf", "application/zip": ".zip",
+                    "application/gzip": ".gz", "application/x-tar": ".tar",
+                    "application/epub+zip": ".epub", "application/rtf": ".rtf",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+                    "application/msword": ".doc", "application/vnd.ms-excel": ".xls",
+                }.get(m.get("mime_type"), "")
+                fname += ext
+            fname = os.path.basename(fname.replace("\\", "/"))
+            # sanitize filename
+            fname = re.sub(r"[^a-zA-Z0-9._-]", "_", fname)[:80] or "media"
+            fp = os.path.join(out_dir, fname)
+            # atomic write
+            if not _safe_write(fp, content):
+                m["saved"] = None
+                continue
+            m["saved"] = fp
+            m["size"] = len(content)
+            if m.get("mime_type", "").lower() in (
+                    "text/plain", "text/csv", "text/html", "text/markdown",
+                    "text/vtt", "application/x-subrip", "text/x-srt",
+                    "application/json", "application/xml", "application/rtf"):
+                if len(content) < 300_000:
+                    try:
+                        m["preview"] = content.decode("utf-8", "replace")
+                    except Exception:
+                        pass
+            LOOG.info(f"saved {fp} ({len(content)} bytes)")
         except Exception as e:
-            m["saved"] = None
-            print(f"[!] download error {e}")
+            LOOG.error(f"download_media item {m.get('url','')[:60]}: {e}\n{traceback.format_exc()}")
+            try:
+                m["saved"] = None
+            except: pass
     return media
+
 
 async def send_dgw(conversation_id, message, token, timeout=90, download_media=False, mode="instant"):
     request_id = str(uuid.uuid4())
@@ -620,11 +925,11 @@ class DGWSession:
 
     # ── messaging ─────────────────────────────────────────────────────
     async def ask(self, message, mode="instant", on_chunk=None, on_reasoning=None,
-                  on_media=None, timeout=180, attachments=None):
-        """Send one message, stream response. Returns (full_text, media_list)."""
+                  on_media=None, timeout=180, attachments=None, persona_id=None, project_id=None, temperature=None, top_p=None, max_tokens=None, thinking_level=None, reasoning_effort=None, model=None, system_prompt=None, search_enabled=None, locale=None, timezone=None, reply_to=None, branch_path=None, imagine=None):
+        """Send one message, stream response. Returns (full_text, media_list). Extended opts mirror Web UI."""
         request_id = str(uuid.uuid4())
         proto = build_request(self.conversation_id, message, request_id, mode=mode,
-                              attachments=attachments)
+                              attachments=attachments, persona_id=persona_id, project_id=project_id, temperature=temperature, top_p=top_p, max_tokens=max_tokens, thinking_level=thinking_level, reasoning_effort=reasoning_effort, model=model, system_prompt=system_prompt, search_enabled=search_enabled, locale=locale or "en-US", timezone=timezone or "Asia/Calcutta", reply_to=reply_to, branch_path=branch_path or "0", imagine=imagine)
         data_fr = make_data_frame(request_id, proto)
 
         if not self._ws_open:
@@ -1121,7 +1426,7 @@ class DGWWorker:
             self.connected.clear()
         asyncio.run_coroutine_threadsafe(_c(), self.loop)
 
-    def ask(self, message, mode, attachments=None):
+    def ask(self, message, mode, attachments=None, **opts):
         import asyncio
         async def _a():
             try:
@@ -1139,6 +1444,7 @@ class DGWWorker:
                     on_chunk=lambda t: self.events.put(("chunk", t)),
                     on_reasoning=lambda t: self.events.put(("reasoning", t)),
                     on_media=lambda m: self.events.put(("media", m)),
+                    **opts
                 )
                 self.events.put(("done", text, media))
             except Exception as e:
@@ -1157,6 +1463,7 @@ class DGWWorker:
                         on_chunk=lambda t: self.events.put(("chunk", t)),
                         on_reasoning=lambda t: self.events.put(("reasoning", t)),
                         on_media=lambda m: self.events.put(("media", m)),
+                        **opts
                     )
                     self.events.put(("done", text, media))
                 except Exception as e2:
@@ -1227,9 +1534,11 @@ def media_kind(m):
 def chat(s):
     mode = "instant"
     show_thinking = False
+    # Extended Web-UI opts (all map to proto fields; defaults match web)
+    opts = {"temperature": None, "top_p": None, "max_tokens": None, "thinking_level": None, "reasoning_effort": None, "persona_id": None, "project_id": None, "search_enabled": None, "locale": "en-US", "timezone": "Asia/Calcutta", "branch_path": "0", "reply_to": None, "system_prompt": None, "model": None, "skill_ids": None}
     print()
     print("=" * 56)
-    print("  Meta AI Chat  —  type /help for commands")
+    print("  Meta AI Chat  —  type /help for commands (full Web-UI coverage)")
     print("=" * 56)
     if s is None:
         print("[*] token-only mode: uuid conversation (no warmup)")
@@ -1263,15 +1572,34 @@ def chat(s):
             print("[*] bye!")
             break
         if m.lower() == "/help":
-            print("""  /mode thinking|instant   switch reasoning mode
-    /think on|off            show/hide the reasoning trace (thinking mode)
-  /img <prompt>             generate an image
-  /upload <file> [prompt]   attach a file (optional follow-up prompt)
-  /new                      start a fresh conversation
-  /login                    force a fresh password login now
-  /token <ecto1:...>        paste a fresh DGW token (instant chat-only fix)
-  /open <file>              open a downloaded file
-  /quit                     exit""")
+            print("""  /mode thinking|instant         switch reasoning mode (agentType 1000/1001)
+    /think on|off                  show/hide reasoning trace (thinking mode)
+  /img <prompt>                  generate an image (/imagine)
+  /imagine <prompt> [n=1] [orientation=square|landscape|portrait]  image generation via ImagineParams
+  /upload <file> [prompt]        attach file (image/video/audio/document) via rupload
+  /new                           start fresh conversation (new promptSessionId)
+  /branch <path>                 set branch path (promptEditConfig, web branching)
+  /reply <messageId>             reply to a specific message (repliedToUniqueMessageId)
+  /persona <id>                  set personaId (web UI persona switcher)
+  /project <id>                  set projectId (metaAiProjectDetails)
+  /convs                         (requires graphql docId) list recent conversations — see /convs_help
+  /temp <0.1-2.0>                 set temperature (ModelInputOverrides)
+  /topp <0.1-1.0>                 set top_p
+  /maxtokens <n>                 set max_tokens / planner_model_max_tokens
+  /thinking_level standard|extended   set thinkingLevel
+  /reasoning low|medium|high|xhigh   set reasoningEffort (overrides thinking)
+  /model <name>                  set model (planner_model / model)
+  /system <prompt>               set system_prompt_template
+  /search on|off                 toggle meta search (isMetasearchInlineEnabled)
+  /locale <en-US|hi-IN|...>      set userLocale
+  /timezone <Asia/Calcutta|...>   set clientTimezone
+  /skill <id1,id2>               set skill_ids
+  /convs_help                    show how to capture conversation-list doc_ids
+  /login                         force fresh password login now
+  /token <ecto1:...>             paste fresh DGW token (DevTools → gateway WS Authorization)
+  /open <file>                   open downloaded file
+  /quit                          exit
+  Web-UI coverage: all proto fields (ModelInputOverrides, ClippyOverrides, ProductContext, Imagine) are now exposed.""")
             continue
         if m.lower() == "/login":
             print("[*] forcing fresh login…")
@@ -1322,6 +1650,237 @@ def chat(s):
             show_thinking = arg in ("on", "1", "true", "yes")
             print(f"[*] thinking trace → {'ON' if show_thinking else 'OFF'}")
             continue
+        if m.lower().startswith("/temp"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            try:
+                opts["temperature"] = float(arg)
+                print(f"[*] temperature → {opts['temperature']}")
+            except:
+                opts["temperature"] = None
+                print("[*] temperature cleared")
+            continue
+        if m.lower().startswith("/topp"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            try:
+                opts["top_p"] = float(arg)
+                print(f"[*] top_p → {opts['top_p']}")
+            except:
+                opts["top_p"] = None
+                print("[*] top_p cleared")
+            continue
+        if m.lower().startswith("/maxtokens"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            try:
+                opts["max_tokens"] = int(arg)
+                print(f"[*] max_tokens → {opts['max_tokens']}")
+            except:
+                opts["max_tokens"] = None
+                print("[*] max_tokens cleared")
+            continue
+        if m.lower().startswith("/thinking_level"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["thinking_level"] = arg or None
+            print(f"[*] thinking_level → {opts['thinking_level']}")
+            continue
+        if m.lower().startswith("/reasoning"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["reasoning_effort"] = arg.upper() if arg else None
+            print(f"[*] reasoning_effort → {opts['reasoning_effort']}")
+            continue
+        if m.lower().startswith("/model"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["model"] = arg or None
+            print(f"[*] model → {opts['model']}")
+            continue
+        if m.lower().startswith("/system"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["system_prompt"] = arg or None
+            print(f"[*] system_prompt → {opts['system_prompt'][:60] if opts['system_prompt'] else 'cleared'}")
+            continue
+        if m.lower().startswith("/search"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            if arg.lower() in ("on","1","true","yes"):
+                opts["search_enabled"] = True
+            elif arg.lower() in ("off","0","false","no"):
+                opts["search_enabled"] = False
+            else:
+                opts["search_enabled"] = None
+            print(f"[*] search_enabled → {opts['search_enabled']}")
+            continue
+        if m.lower().startswith("/persona"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["persona_id"] = arg or None
+            print(f"[*] persona_id → {opts['persona_id']}")
+            continue
+        if m.lower().startswith("/project"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["project_id"] = arg or None
+            print(f"[*] project_id → {opts['project_id']}")
+            continue
+        if m.lower().startswith("/locale"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["locale"] = arg or "en-US"
+            print(f"[*] locale → {opts['locale']}")
+            continue
+        if m.lower().startswith("/timezone"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["timezone"] = arg or "Asia/Calcutta"
+            print(f"[*] timezone → {opts['timezone']}")
+            continue
+        if m.lower().startswith("/branch"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["branch_path"] = arg or "0"
+            print(f"[*] branch_path → {opts['branch_path']}")
+            continue
+        if m.lower().startswith("/reply"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["reply_to"] = arg or None
+            print(f"[*] reply_to → {opts['reply_to']}")
+            continue
+        if m.lower().startswith("/skill"):
+            arg = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            opts["skill_ids"] = [x.strip() for x in arg.split(",")] if arg else None
+            print(f"[*] skill_ids → {opts['skill_ids']}")
+            continue
+        if m.lower().startswith("/convs_help"):
+            print("To list conversations: open DevTools → Network → Filter 'graphql' → reload meta.ai → find doc_id for conversation list (looks like 32 hex). Then: s.post(GQL, json={'doc_id': '<id>', 'variables': {}})")
+            continue
+        if m.lower().startswith("/convs"):
+            # attempt to list via known doc_ids; if none, inform
+            try:
+                r = gql(s, DOC_WARMUP, {"conversationId": conv})
+                print(f"[convs] warmup check {r.status_code} — conversationId {conv[:8]} valid. For full history, supply doc_id via /convs_help")
+            except Exception as e:
+                print(f"[!] convs check failed: {e}")
+            continue
+        if m.lower().startswith("/imagine"):
+            rest = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
+            if not rest:
+                print("usage: /imagine <prompt> [n=1] [orientation=square|landscape|portrait]")
+                continue
+            # parse n and orientation
+            import shlex
+            try:
+                parts = shlex.split(rest)
+            except:
+                parts = rest.split()
+            prompt_parts = []
+            n_media = 1
+            orientation = "square"
+            for p in parts:
+                if p.startswith("n="):
+                    try: n_media = int(p[2:])
+                    except: pass
+                elif p.startswith("orientation="):
+                    orientation = p.split("=",1)[1]
+                else:
+                    prompt_parts.append(p)
+            prompt = " ".join(prompt_parts)
+            imagine_cfg = {"operation": "IMAGINE_OPERATION_TEXT_TO_IMAGE", "params": {"prompt": prompt, "num_media": n_media, "orientation": orientation, "media_type": "image"}}
+            print(f"[*] imagine → {prompt[:60]} n={n_media} orientation={orientation}")
+            # send as imagine proto rather than string hack
+            history.append(f"/imagine {prompt}")
+            print("Meta: ", end="", flush=True)
+            worker.ask(prompt, mode, None, **{k:v for k,v in opts.items() if v is not None}, imagine=imagine_cfg)
+            # skip default worker.ask below
+            done = None
+            last_error = None
+            interrupted = False
+            thinking_shown = False
+            saw_content = False
+            spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
+            spin_i = 0
+            spin_on = False
+            last_act = time.time()
+            while done is None and not interrupted:
+                try:
+                    ev = worker.events.get(timeout=0.25)
+                    last_act = time.time()
+                    if spin_on:
+                        print("\r" + " " * 44 + "\r", end="", flush=True)
+                        spin_on = False
+                except __import__("queue").Empty:
+                    idle = time.time() - last_act
+                    if not saw_content or idle >= 1.5:
+                        status = ("thinking…" if (show_thinking or thinking_shown) else "working…")
+                        line = f"{spin[spin_i % len(spin)]} {status} {idle:.0f}s"
+                        print("\r\x1b[90m" + line.ljust(20) + "\x1b[0m", end="", flush=True)
+                        spin_i += 1
+                        spin_on = True
+                    continue
+                except KeyboardInterrupt:
+                    interrupted = True
+                    if spin_on:
+                        print("\r" + " " * 44 + "\r", end="", flush=True)
+                    worker.reset_session()
+                    worker.discard_events()
+                    continue
+                if ev[0] == "chunk":
+                    if not saw_content:
+                        print("Meta: ", end="", flush=True)
+                        saw_content = True
+                    text = clean_chunk(ev[1])
+                    if text:
+                        print(text, end="", flush=True)
+                elif ev[0] == "reasoning":
+                    if show_thinking:
+                        if not saw_content:
+                            print("Meta: ", end="", flush=True)
+                            saw_content = True
+                        t = clean_chunk(ev[1])
+                        if t:
+                            print(f"\x1b[90m{t}\x1b[0m", end="", flush=True)
+                    else:
+                        thinking_shown = True
+                elif ev[0] == "media":
+                    if not saw_content:
+                        print("Meta: ", end="", flush=True)
+                        saw_content = True
+                    mrec = ev[1]
+                    name = (mrec.get("filename") or os.path.basename(mrec.get("url") or "") or "attachment")
+                    print(f"\n[media] {mrec.get('mime_type', '')} {name}")
+                elif ev[0] == "done":
+                    done = ev
+                    for mi in (ev[2] or []):
+                        sp = mi.get("saved")
+                        if sp:
+                            print(f"\n[{media_kind(mi)}] {sp} ({mi.get('size', '?')} bytes)")
+                            pv = mi.get("preview")
+                            if pv:
+                                pv = " ".join(pv.split())
+                                print("   ↳ " + pv[:180])
+                elif ev[0] == "error":
+                    last_error = ev[1]
+                    done = ev
+                elif ev[0] == "ws_error":
+                    if not saw_content:
+                        print("\r" + " " * 44 + "\r", end="", flush=True)
+                    txt = str(ev[1])
+                    print(f"\n[ws] {txt}")
+                    if ("401" in txt or "nauthorized" in txt) and not healed:
+                        healed = True
+                        ns = get_session()
+                        if ns is not None:
+                            s = ns
+                            try:
+                                conv = create_conversation(s)
+                            except Exception:
+                                pass
+                        worker.close()
+                        worker = DGWWorker(conv)
+                        worker.connect()
+                        worker.ask(prompt, mode, None, **{k:v for k,v in opts.items() if v is not None}, imagine=imagine_cfg)
+            if not saw_content:
+                print("\r" + " " * 44 + "\r", end="", flush=True)
+                if interrupted:
+                    print("\n[!] interrupted — current reply discarded")
+                elif last_error:
+                    print(f"\n[!] error: {last_error}")
+                else:
+                    print("[!] empty response")
+            else:
+                print()
+            continue
         if m.lower().startswith("/open"):
             fp = m.split(maxsplit=1)[1].strip() if len(m.split(maxsplit=1)) > 1 else ""
             if fp and os.path.exists(fp):
@@ -1367,7 +1926,7 @@ def chat(s):
         history.append(m)
         print("Meta: ", end="", flush=True)
         healed = False
-        worker.ask(m, mode, upload_attachments)
+        worker.ask(m, mode, upload_attachments, **{k:v for k,v in opts.items() if v is not None})
         done = None
         last_error = None
         interrupted = False

@@ -11,11 +11,68 @@ missing, the script regenerates it by itself — no manual /login needed.
 import io, json, os, sys, time, uuid, random, threading, re, base64
 from datetime import datetime
 from urllib.parse import parse_qs
-from curl_cffi import requests
-from nacl.public import SealedBox, PublicKey
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+try:
+    from curl_cffi import requests
+    from nacl.public import SealedBox, PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError as _e:
+    print(f"[!] Missing dependency: {_e}")
+    print(f"    Install with: pip install curl_cffi PyNaCl cryptography")
+    try:
+        import subprocess
+        print("[*] Attempting auto-install...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "curl_cffi", "PyNaCl", "cryptography", "--quiet"])
+        print("[+] Auto-install done, please rerun")
+    except Exception as _ae:
+        print(f"[!] Auto-install failed: {_ae}")
+    sys.exit(1)
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── reliability: logging, safe I/O, validation ──────────────────────────
+import logging, traceback, pathlib
+LOG_FILE = os.path.join(ROOT_DIR, "vibes.log")
+try:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)])
+except Exception:
+    logging.basicConfig(level=logging.INFO)
+VLOOG = logging.getLogger("vibes")
+def _v_safe_write(path, data_bytes):
+    try:
+        tmp = path + ".tmp"
+        d = os.path.dirname(path)
+        if d: os.makedirs(d, exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(data_bytes); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        VLOOG.warning(f"safe_write {path}: {e}")
+        try:
+            with open(path, "wb") as f: f.write(data_bytes)
+            return True
+        except Exception as e2:
+            VLOOG.error(f"fallback write {path}: {e2}")
+            return False
+def _v_validate_file(path, max_mb=200):
+    if not path or not isinstance(path, str): raise ValueError("file path required")
+    if not os.path.exists(path): raise FileNotFoundError(f"file not found: {path}")
+    if not os.path.isfile(path): raise ValueError(f"not a file: {path}")
+    sz = os.path.getsize(path)
+    if sz == 0: raise ValueError("file is empty")
+    if sz > max_mb*1024*1024: raise ValueError(f"file {sz} exceeds {max_mb} MB")
+    return path
+def _v_retry(fn, retries=3, base=0.8):
+    last=None
+    for i in range(retries+1):
+        try: return fn()
+        except Exception as e:
+            last=e
+            if i>=retries: break
+            d=min(base*(2**i)+random.random(), 8)
+            VLOOG.warning(f"retry {i+1}/{retries} {type(e).__name__}: {e} sleep {d:.1f}s")
+            time.sleep(d)
+    raise last
 
 # ── embedded session (materializes once into ./session.json) ────────────
 # auto-updated by save_session(): the newest WORKING session travels
@@ -434,19 +491,51 @@ def load_session():
     return s
 
 def save_session(s):
-    """Persist the whole cookie jar (not just meta_session) + update the
-    embedded copy inside this file so it logs in anywhere."""
-    data = {"impersonate": IMPERSONATE, "saved_at": time.time()}
-    ck = None
-    for c in _jar_list(s):
-        if c["name"] == "meta_session" and ck is None and c["value"]:
-            ck = c["value"]
-        data.setdefault("cookies", []).append(c)
-    data["meta_session"] = ck
-    with open(SESSION_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    _update_embedded(json.dumps(data, indent=2))
-    return ck
+    """Persist the whole cookie jar (not just meta_session) + update the embedded copy (atomic, hardened)."""
+    try:
+        data = {"impersonate": IMPERSONATE, "saved_at": time.time()}
+        ck = None
+        try:
+            jar = _jar_list(s)
+        except Exception as e:
+            VLOOG.error(f"save_session _jar_list: {e}")
+            jar = []
+        for c in jar:
+            try:
+                if c.get("name") == "meta_session" and ck is None and c.get("value"):
+                    ck = c["value"]
+                data.setdefault("cookies", []).append(c)
+            except Exception as e:
+                VLOOG.warning(f"save_session cookie {c}: {e}")
+                continue
+        data["meta_session"] = ck
+        if not ck:
+            VLOOG.warning("save_session: no meta_session in jar")
+        # atomic write
+        try:
+            payload = json.dumps(data, indent=2).encode("utf-8")
+            if not _v_safe_write(SESSION_FILE, payload):
+                VLOOG.error(f"save_session safe_write failed {SESSION_FILE}")
+                # fallback
+                with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+        except Exception as e:
+            VLOOG.error(f"save_session write: {e}\n{traceback.format_exc()}")
+            try:
+                with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception as e2:
+                VLOOG.error(f"fallback write failed: {e2}")
+                return ck
+        try:
+            _update_embedded(json.dumps(data, indent=2))
+        except Exception as e:
+            VLOOG.warning(f"save_session embed: {e}")
+        VLOOG.info(f"save_session ok meta_session {str(ck)[:8]}...")
+        return ck
+    except Exception as e:
+        VLOOG.error(f"save_session fatal: {e}\n{traceback.format_exc()}")
+        return None
 
 def clear_session():
     if os.path.exists(SESSION_FILE):
@@ -727,6 +816,41 @@ class Vibes:
         j = self._j("GET", f"/projects/{pid}/timeline/export/pending")
         return j.get("pending") if isinstance(j, dict) else None
 
+    def sync(self, entity_type="project", entity_id=None):
+        """GET /api/sync?entityType=project&entityId=<id> — lightweight poll for updatedAt. Web polls this every ~2s."""
+        if not entity_id:
+            raise VibesError("sync requires entity_id")
+        j = self._j("GET", f"/sync?entityType={entity_type}&entityId={entity_id}")
+        return j if isinstance(j, dict) else {}
+
+    def sync_stream(self, entity_type="project", entity_id=None, timeout=30):
+        """GET /api/sync/stream?entityType=project&entityId=<id> — SSE stream (web uses for live project sync)."""
+        if not entity_id:
+            raise VibesError("sync_stream requires entity_id")
+        url = API + f"/sync/stream?entityType={entity_type}&entityId={entity_id}"
+        try:
+            r = self.s.get(url, headers=self.hdr, stream=True, timeout=timeout)
+            # Collect SSE lines until timeout or completion
+            chunks = []
+            for raw in r.iter_lines(decode_unicode=True):
+                if raw is None:
+                    continue
+                line = raw.strip()
+                if line.startswith("data:"):
+                    try:
+                        chunks.append(json.loads(line[5:].strip()))
+                    except Exception:
+                        chunks.append(line[5:].strip())
+            return chunks
+        except Exception as e:
+            raise VibesError(f"sync_stream failed: {e}")
+
+    def timeline_export(self, pid, composition=None):
+        """POST /api/projects/{pid}/timeline/export — trigger full timeline export (web: Export button). Composition is optional."""
+        body = {"composition": composition} if composition else {}
+        j = self._j("POST", f"/projects/{pid}/timeline/export", json=body)
+        return j if isinstance(j, dict) else {}
+
     def all_assets(self):
         """Global asset stream across projects (web: project-assets)."""
         j = self._j("GET", "/project-assets")
@@ -937,6 +1061,48 @@ class Vibes:
                 "batchId": batch_id, "mg_request_id": "www-" + _uuid_uuid(),
                 "projectId": project["id"]}
         return self._j("POST", "/generate/videos", json=body)
+
+    def generate_edit(self, project, batch_id, prompt, source_content_id, aspect="9:16", extra=None):
+        """Edit/restyle/extend: generic generation against an existing content item (edit, video-to-video, extend)."""
+        cfg = {"directGeneration": True, "promptModel": "gemini-2.5-flash", "aspectRatio": aspect,
+               "imageModel": "midjen-base", "videoModel": "midjen-short", "resolution": "720p",
+               "batchVariation": True, "sourceContentItemIds": [{"id": source_content_id, "source": "video"}]}
+        if isinstance(extra, dict):
+            cfg.update(extra)
+        body = {"inputs": [{"type": "prompt", "value": prompt, "original_prompt": prompt, "config": cfg}],
+                "config": {**cfg, "generationType": extra.get("generationType", "edit") if isinstance(extra, dict) and "generationType" in extra else "edit"},
+                "batchId": batch_id, "mg_request_id": "www-" + _uuid_uuid(), "projectId": project["id"] if isinstance(project, dict) else project}
+        return self._j("POST", "/generate/videos", json=body)
+
+    def generate_with_ingredients(self, project, batch_id, prompt, ingredient_ids=None, aspect="9:16", n=1, resolution="720p", extra=None):
+        """Generation using reusable ingredients (CHARACTER / STYLE / SCENE). ingredient_ids is list of ingredientId."""
+        cfg = {"directGeneration": True, "promptModel": "gemini-2.5-flash", "aspectRatio": aspect,
+               "imageModel": "midjen-base", "videoModel": "midjen-short", "resolution": resolution,
+               "batchVariation": True}
+        if ingredient_ids:
+            cfg["ingredientIds"] = ingredient_ids
+            cfg["promptSegments"] = [{"segmentType": "ingredient", "text": prompt, "ingredientIds": ingredient_ids}]
+        if isinstance(extra, dict):
+            cfg.update(extra)
+        inputs = [{"type": "prompt", "value": prompt, "original_prompt": prompt, "config": cfg} for _ in range(max(1, n))]
+        body = {"inputs": inputs, "config": {**cfg, "generationType": "t2v"}, "batchId": batch_id, "mg_request_id": "www-" + _uuid_uuid(), "projectId": project["id"] if isinstance(project, dict) else project}
+        return self._j("POST", "/generate/videos", json=body)
+
+    def studio_ingredients_search(self, query, owner="LIBRARY"):
+        """Search ingredients by name (client-side filter over studio_ingredients)."""
+        ing, info = self.studio_ingredients(owner)
+        q = query.lower()
+        return [x for x in ing if q in (x.get("name","").lower() + x.get("description","").lower())], info
+
+    def create_ingredient(self, name, ingredient_type="CHARACTER", description=None, media=None):
+        """POST /api/studio/ingredients — create reusable CHARACTER/STYLE/SCENE ingredient (if web allows)."""
+        body = {"name": name, "ingredientType": ingredient_type}
+        if description:
+            body["description"] = description
+        if media:
+            body["mediaEntId"] = media.get("mediaEntId") if isinstance(media, dict) else media
+            body["cdnUrl"] = media.get("cdnUrl") if isinstance(media, dict) else None
+        return self._j("POST", "/studio/ingredients", json=body)
 
     def stream_batch(self, batch_id, timeout=90):
         url = API + f"/generation-batches/{batch_id}/stream"
@@ -1213,8 +1379,8 @@ def build_config(**kw):
 Type a plain prompt to generate 1 video; it auto-downloads to vibes/media/.
 
 Commands:
-  session:      /login /logout /me /status /geo
-  projects:     /projects /use <id|index> /new /rename <name> /dup /delete /assets /export /content
+  session:      /login /logout /me /status /geo /sync /sync_stream
+  projects:     /projects /use <id|index> /new /rename <name> /dup /delete /assets /export /exportnow /content /search <q> /composition [json]
   generate:     type a prompt              → 1 video (auto project, auto download)
                 /img <prompt>              → 1 image/still (1:1)
                 /v <prompt>                → video w/ options:
@@ -1222,13 +1388,15 @@ Commands:
                      [model=<midjen-short|midjen-long|midjen>]
                 /ref <file>                → set reference image (image-to-video)
                 /audio <file>              → upload audio (for lip-sync)
-                /lipsync <voiceId> <text>  → TTS lip-sync on current reference
+                /lipsync <prompt>          → lip-sync on current reference (/ref + /audio)
+                /edit <contentId> <prompt> → edit/restyle existing video (video-to-video)
+                /ingredient <name> type=CHARACTER|STYLE|SCENE → create reusable ingredient
   media:        /media [video|images|audio] [type]
                     /fav <itemId>            or /unfav
                     /dl <url> [name]
-                    /del <itemId>  /delbatch <batchId>
-  studio:       /voices  /ing [LIBRARY|VIEWER]
-  system:       /bug-report  /report <issue>
+                    /del <itemId>  /delbatch <batchId> /bulkdel <id1,id2>
+  studio:       /voices  /ing [LIBRARY|VIEWER] /ing_search <q>
+  system:       /bug-report  /report <issue> /analytics
 
 Examples:
   > a red fox jumping in snow, cinematic          # auto t2v
@@ -1651,6 +1819,82 @@ def dispatch(op, arg):
             prompt.append(t)
             i += 1
         gen(" ".join(prompt), n=n, aspect=aspect, resolution=res, model=model)
+    elif op == "/sync":
+        if not CUR:
+            print("[!] no current project")
+            return
+        print(v.sync(entity_id=pid()))
+    elif op == "/sync_stream":
+        if not CUR:
+            print("[!] no current project")
+            return
+        print(v.sync_stream(entity_id=pid()))
+    elif op == "/search":
+        if not arg:
+            print("[!] usage: /search <query>  (searches projects + ingredients + media)")
+            return
+        print(f"projects matching '{arg}':")
+        for p in v.list_projects(search=arg):
+            print(f"  {p['id']} {p.get('name')}")
+        print(f"ingredients matching '{arg}':")
+        ing, _ = v.studio_ingredients_search(arg)
+        for it in ing[:20]:
+            print(f"  {it.get('ingredientId')} {it.get('name')}")
+        print(f"media search via library favorites? use /media")
+    elif op == "/bulkdel":
+        if not arg:
+            print("[!] usage: /bulkdel <id1,id2,...>")
+            return
+        ids = [x.strip() for x in arg.split(",") if x.strip()]
+        print(v.bulk_delete_items(ids))
+    elif op == "/composition":
+        if not CUR:
+            print("[!] no current project")
+            return
+        if arg:
+            try:
+                comp = json.loads(arg)
+            except Exception:
+                comp = {"custom": arg}
+            print(v.save_composition(pid(), comp))
+        else:
+            proj = v.get_project(pid())
+            print(json.dumps(proj.get("composition", {}) if proj else {}, indent=2)[:2000])
+    elif op == "/exportnow":
+        if not CUR:
+            print("[!] no current project")
+            return
+        print(v.timeline_export(pid()))
+    elif op == "/ingredient":
+        if not arg:
+            print("[!] usage: /ingredient <name> [type=CHARACTER|STYLE|SCENE] [media=<file>]")
+            return
+        # parse name and type
+        parts = arg.split()
+        name = parts[0]
+        itype = "CHARACTER"
+        for p in parts[1:]:
+            if p.startswith("type="):
+                itype = p.split("=",1)[1].upper()
+        print(v.create_ingredient(name, ingredient_type=itype))
+    elif op == "/edit":
+        if not arg:
+            print("[!] usage: /edit <contentId> <prompt>  (edit/restyle video)")
+            return
+        cid, _, prompt = arg.partition(" ")
+        if not cid or not prompt.strip():
+            print("[!] need both contentId and prompt")
+            return
+        if not ensure():
+            return
+        bid = C.make_batch(CUR, prompt, n=1, aspect="9:16", batch_type="videos")
+        res = C.generate_edit(CUR, bid, prompt.strip(), source_content_id=cid)
+        print(res)
+        try:
+            items = C.wait_generation(bid, project=CUR)
+            download_all(items)
+        except Exception as e:
+            print(f"[!] wait failed: {e}")
     elif op == "/exportall":
         pass
     elif op == "/help":
@@ -1683,14 +1927,28 @@ def repl():
         _auto_login()                # self-heal right away
     print("> type a prompt → generate videos (auto-save to vibes/media/)")
     print("> /help  /projects  /media  /voices  /img  /v  /ref /  /upload  /dl  /dup…")
+    consecutive_errors = 0
     while True:
         try:
             raw = input("vibes> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nbye")
             break
+        except Exception as e:
+            VLOOG.error(f"input error: {e}")
+            consecutive_errors += 1
+            if consecutive_errors > 10:
+                print("[!] too many input errors, exiting safely")
+                break
+            time.sleep(0.5)
+            continue
         if not raw:
             continue
+        if len(raw) > 60000:
+            print(f"[!] input too long {len(raw)} chars, truncated")
+            raw = raw[:60000]
+            VLOOG.warning(f"input truncated {len(raw)}")
+        consecutive_errors = 0
         if raw.startswith("/"):
             parts = raw.split(None, 1)
             op, arg = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
@@ -1710,24 +1968,58 @@ def repl():
                 done = True
                 break
             except VibesError as e:
+                VLOOG.warning(f"VibesError {op}: {e} status={getattr(e,'status',None)}")
                 print("[!]", e)
                 if getattr(e, "status", None) == 401 and attempt == 0:
                     C = None
-                    if _auto_login():
-                        continue       # session regenerated → retry the command
+                    try:
+                        if _auto_login():
+                            continue       # session regenerated → retry the command
+                    except Exception as ae:
+                        VLOOG.error(f"_auto_login: {ae}")
                 done = True
                 break
             except Exception as e:
+                VLOOG.error(f"dispatch {op} {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 print("[!]", type(e).__name__, e)
+                consecutive_errors += 1
+                if consecutive_errors > 20:
+                    print("[!] too many errors, pausing 5s")
+                    time.sleep(5)
+                    consecutive_errors = 0
                 done = True
                 break
 
 
 if __name__ == "__main__":
-    # fix Windows stdout encoding (only when actually running the REPL)
-    if not (getattr(sys.stdout, "encoding", None) or "").lower().startswith("utf"):
+    try:
+        # fix Windows stdout encoding (only when actually running the REPL)
+        if not (getattr(sys.stdout, "encoding", None) or "").lower().startswith("utf"):
+            try:
+                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+            except Exception:
+                pass
         try:
-            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-    repl()
+            repl()
+        except KeyboardInterrupt:
+            print("\n[*] bye!")
+        except Exception as e:
+            VLOOG.error(f"repl fatal: {e}\n{traceback.format_exc()}")
+            print(f"[!] repl crashed: {e} — restarting...")
+            try:
+                time.sleep(1)
+                repl()
+            except Exception as e2:
+                VLOOG.error(f"second repl crash: {e2}\n{traceback.format_exc()}")
+                print(f"[!] second crash: {e2} — exiting safely")
+                sys.exit(0)
+    except Exception as e:
+        try:
+            VLOOG.error(f"__main__ fatal: {e}\n{traceback.format_exc()}")
+        except: pass
+        print(f"[!] fatal: {e}")
+        try:
+            # try tokenless repl still? just exit gracefully
+            sys.exit(0)
+        except:
+            sys.exit(1)
