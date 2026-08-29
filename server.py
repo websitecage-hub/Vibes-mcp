@@ -22,8 +22,10 @@ so Render's free disk can never fill up.
 import asyncio
 import base64
 import glob
+import hashlib
 import json
 import os
+import secrets
 import tempfile
 import threading
 import time
@@ -492,6 +494,25 @@ async def _janitor_loop():
 
 # ── hub projects (persistent context per Image/Video/Animate) ────────────
 
+API_KEYS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_keys.json")
+MASTER_API_KEY = os.environ.get("MASTER_API_KEY", os.environ.get("API_KEY", "")).strip()
+
+def _load_api_keys():
+    try:
+        if os.path.exists(API_KEYS_FILE):
+            import json as _js
+            return set(_js.load(open(API_KEYS_FILE)).get("keys",[]))
+    except: pass
+    return set()
+
+def _save_api_keys(keys):
+    try:
+        tmp=API_KEYS_FILE+".tmp"
+        open(tmp,"w").write(__import__("json").dumps({"keys":sorted(keys)},indent=2))
+        os.replace(tmp,API_KEYS_FILE)
+        return True
+    except: return False
+
 PROJECTS: dict = {}
 PROJECTS_LOCK = __import__("threading").Lock()
 
@@ -594,7 +615,7 @@ async def generate_image(prompt: str, project_id: str = "") -> list:
     try:
         hub = _get_hub_project(project_id) if project_id else None
         cid = hub["conversation_id"] if hub else None
-        res = await meta_ask("/imagine " + prompt, timeout=180, conversation_id=cid)
+        res = await meta_ask("/imagine " + prompt, mode=mode if mode in ("instant","thinking") else "instant", timeout=int(body.get("timeout",180)), conversation_id=cid)
         if hub:
             with PROJECTS_LOCK:
                 hub["history"].append({"prompt": prompt, "urls": [m["url"] for m in res["media"] if m.get("url")], "at": __import__("time").time()})
@@ -1029,15 +1050,22 @@ from fastapi.responses import HTMLResponse
 
 @app.post("/api/image")
 async def api_image(req: Request):
+    # API key optional for browser, required for external — validate if provided
+    _k = req.headers.get("x-api-key") or (req.headers.get("authorization","").split("Bearer ")[-1] if "Bearer" in req.headers.get("authorization","") else "")
+    _valid=_load_api_keys()
+    if MASTER_API_KEY: _valid.add(MASTER_API_KEY)
+    if _k and _k not in _valid:
+        return __import__("fastapi").responses.JSONResponse({"error":"invalid api key"},status_code=401)
     try:
         body = await req.json()
         prompt = str(body.get("prompt", "")).strip()
         project_id = str(body.get("project_id") or "").strip() or None
+        mode = str(body.get("mode") or "instant").strip()
         if not prompt:
             return JSONResponse({"error": "prompt required"}, status_code=400)
         hub = _get_hub_project(project_id) if project_id else None
         cid = hub["conversation_id"] if hub else None
-        res = await meta_ask("/imagine " + prompt, timeout=180, conversation_id=cid)
+        res = await meta_ask("/imagine " + prompt, mode=mode if mode in ("instant","thinking") else "instant", timeout=int(body.get("timeout",180)), conversation_id=cid)
         urls = [m["url"] for m in res["media"] if m.get("url")]
         if hub:
             with PROJECTS_LOCK:
@@ -1045,13 +1073,18 @@ async def api_image(req: Request):
         if not urls:
             msg = (res.get("text") or "").strip() or "No image returned — try rephrasing the prompt."
             return JSONResponse({"urls": [], "error": msg[:600]})
-        return JSONResponse({"urls": urls})
+        return JSONResponse({"urls": urls, "text": res.get("text","")[:600], "conversation_id": cid or res.get("conversation_id")})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"error": str(e)[:300]}, status_code=500)
 
 
 @app.post("/api/video")
 async def api_video(req: Request):
+    _k = req.headers.get("x-api-key") or (req.headers.get("authorization","").split("Bearer ")[-1] if "Bearer" in req.headers.get("authorization","") else "")
+    _valid=_load_api_keys()
+    if MASTER_API_KEY: _valid.add(MASTER_API_KEY)
+    if _k and _k not in _valid:
+        return __import__("fastapi").responses.JSONResponse({"error":"invalid api key"},status_code=401)
     try:
         body = await req.json()
         prompt = str(body.get("prompt", "")).strip()
@@ -1061,9 +1094,9 @@ async def api_video(req: Request):
         jid = _start_job("video", _run_vibe_gen, prompt,
                          body.get("aspect_ratio", "9:16"),
                          body.get("resolution", "480p"),
-                         body.get("model") or None,
-                         int(body.get("count", 1)), 420,
-                         body.get("reference_image_url") or None, "t2v",
+                         body.get("model") or body.get("videoModel") or None,
+                         int(body.get("count") or body.get("n") or 1), int(body.get("timeout",420)),
+                         body.get("reference_image_url") or body.get("ref_url") or None, body.get("generationType") or body.get("gen_type") or "t2v",
                          project_id)
         return JSONResponse({"job_id": jid})
     except Exception as e:  # noqa: BLE001
@@ -1136,6 +1169,26 @@ async def api_create_project(req: __import__("fastapi").Request):
     name = str(body.get("name", "")).strip()
     return JSONResponse(_create_hub_project(kind, name))
 
+
+@app.get("/api/keys")
+async def api_list_keys(req: Request):
+    key=req.headers.get("x-api-key") or (req.headers.get("authorization","").split("Bearer ")[-1] if "Bearer" in req.headers.get("authorization","") else "")
+    valid=_load_api_keys()
+    if MASTER_API_KEY: valid.add(MASTER_API_KEY)
+    if key not in valid and (MASTER_API_KEY and key!=MASTER_API_KEY):
+        return JSONResponse({"error":"unauthorized"},status_code=401)
+    return JSONResponse({"keys":[k[:8]+"…"+k[-4:] for k in valid], "count":len(valid)})
+
+@app.post("/api/keys")
+async def api_create_key(req: Request):
+    key=req.headers.get("x-api-key") or (req.headers.get("authorization","").split("Bearer ")[-1] if "Bearer" in req.headers.get("authorization","") else "")
+    valid=_load_api_keys()
+    if MASTER_API_KEY: valid.add(MASTER_API_KEY)
+    if MASTER_API_KEY and key!=MASTER_API_KEY and key not in valid:
+        return JSONResponse({"error":"unauthorized - need master key"},status_code=401)
+    newk="sk-"+__import__("secrets").token_urlsafe(32)
+    valid.add(newk); _save_api_keys(valid)
+    return JSONResponse({"api_key":newk})
 
 # ── web app ───────────────────────────────────────────────────────────────
 
