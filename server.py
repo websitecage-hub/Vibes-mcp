@@ -317,7 +317,7 @@ def _run_vibe_gen(prompt, aspect, resolution, model, n, max_sec,
         else:
             project = _ensure_project(v)
         oref = None
-        gen_type = gen_kind if gen_kind in ("t2v", "i2v") else "t2v"
+        # normalize generation type
         if reference_image_url:
             tmp = _download_temp(reference_image_url,
                                  _suffix_for_url(reference_image_url))
