@@ -13,3 +13,5 @@ vibes.log
 *.log
 .venv/
 app.log
+*.har
+api_keys.json

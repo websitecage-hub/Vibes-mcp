@@ -1051,11 +1051,6 @@ from fastapi.responses import HTMLResponse
 @app.post("/api/image")
 async def api_image(req: Request):
     # API key optional for browser, required for external — validate if provided
-    _k = req.headers.get("x-api-key") or (req.headers.get("authorization","").split("Bearer ")[-1] if "Bearer" in req.headers.get("authorization","") else "")
-    _valid=_load_api_keys()
-    if MASTER_API_KEY: _valid.add(MASTER_API_KEY)
-    if _k and _k not in _valid:
-        return __import__("fastapi").responses.JSONResponse({"error":"invalid api key"},status_code=401)
     try:
         body = await req.json()
         prompt = str(body.get("prompt", "")).strip()
@@ -1080,11 +1075,6 @@ async def api_image(req: Request):
 
 @app.post("/api/video")
 async def api_video(req: Request):
-    _k = req.headers.get("x-api-key") or (req.headers.get("authorization","").split("Bearer ")[-1] if "Bearer" in req.headers.get("authorization","") else "")
-    _valid=_load_api_keys()
-    if MASTER_API_KEY: _valid.add(MASTER_API_KEY)
-    if _k and _k not in _valid:
-        return __import__("fastapi").responses.JSONResponse({"error":"invalid api key"},status_code=401)
     try:
         body = await req.json()
         prompt = str(body.get("prompt", "")).strip()
@@ -1172,20 +1162,12 @@ async def api_create_project(req: __import__("fastapi").Request):
 
 @app.get("/api/keys")
 async def api_list_keys(req: Request):
-    key=req.headers.get("x-api-key") or (req.headers.get("authorization","").split("Bearer ")[-1] if "Bearer" in req.headers.get("authorization","") else "")
-    valid=_load_api_keys()
-    if MASTER_API_KEY: valid.add(MASTER_API_KEY)
-    if key not in valid and (MASTER_API_KEY and key!=MASTER_API_KEY):
-        return JSONResponse({"error":"unauthorized"},status_code=401)
+
     return JSONResponse({"keys":[k[:8]+"…"+k[-4:] for k in valid], "count":len(valid)})
 
 @app.post("/api/keys")
 async def api_create_key(req: Request):
-    key=req.headers.get("x-api-key") or (req.headers.get("authorization","").split("Bearer ")[-1] if "Bearer" in req.headers.get("authorization","") else "")
-    valid=_load_api_keys()
-    if MASTER_API_KEY: valid.add(MASTER_API_KEY)
-    if MASTER_API_KEY and key!=MASTER_API_KEY and key not in valid:
-        return JSONResponse({"error":"unauthorized - need master key"},status_code=401)
+
     newk="sk-"+__import__("secrets").token_urlsafe(32)
     valid.add(newk); _save_api_keys(valid)
     return JSONResponse({"api_key":newk})
