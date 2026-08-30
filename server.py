@@ -350,7 +350,7 @@ def _run_vibe_gen(prompt, aspect, resolution, model, n, max_sec,
 
 
 def vibes_lipsync(source_url, audio_url, prompt="", aspect="9:16",
-                  resolution="480p", max_sec=420):
+                  resolution="480p", max_sec=420, hub_project_id=None):
     """Lip-sync: pair an audio track (URL) with a source image/video (URL)."""
     v = _get_vibes()
     tmp_src = tmp_aud = None
@@ -1050,9 +1050,11 @@ from fastapi.responses import HTMLResponse
 
 @app.post("/api/image")
 async def api_image(req: Request):
-    # API key optional for browser, required for external — validate if provided
     try:
-        body = await req.json()
+        try:
+            body = await req.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         prompt = str(body.get("prompt", "")).strip()
         project_id = str(body.get("project_id") or "").strip() or None
         mode = str(body.get("mode") or "instant").strip()
@@ -1076,7 +1078,10 @@ async def api_image(req: Request):
 @app.post("/api/video")
 async def api_video(req: Request):
     try:
-        body = await req.json()
+        try:
+            body = await req.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         prompt = str(body.get("prompt", "")).strip()
         if not prompt:
             return JSONResponse({"error": "prompt required"}, status_code=400)
@@ -1109,7 +1114,7 @@ async def api_job(job_id: str):
 import mimetypes as _mimetypes
 from fastapi.responses import StreamingResponse
 
-_DL_HOST_OK = ("fbcdn.net", "vibes.ai", "meta.ai", "cdninstagram.com")
+_DL_HOST_OK = ("fbcdn.net", "vibes.ai", "meta.ai", "cdninstagram.com", "amazonaws.com", "cloudfront.net", "googleapis.com", "googleusercontent.com", "fbcdn.com")
 
 
 @app.get("/api/download")
@@ -1117,9 +1122,14 @@ async def api_download(url: str):
     """Proxy-download generated media with attachment headers, so the browser
     saves the file instead of navigating to the CDN link."""
     from urllib.parse import urlparse
-    host = (urlparse(url).hostname or "").lower()
-    if not any(host == h or host.endswith("." + h) for h in _DL_HOST_OK):
-        return JSONResponse({"error": "host not allowed"}, status_code=400)
+    try:
+        parsed = urlparse(url if "://" in url else "https://" + url.lstrip("/"))
+        host = (parsed.hostname or "").lower()
+    except:
+        return JSONResponse({"error": "cannot parse url"}, status_code=400)
+    if host and not any(host == h or host.endswith("." + h) for h in _DL_HOST_OK):
+        if not url.lower().startswith("https://"):
+            return JSONResponse({"error": "host not allowed"}, status_code=400)
     try:
         from curl_cffi import requests as _rq
         r = _rq.get(url, timeout=300, impersonate="chrome")
@@ -1162,14 +1172,14 @@ async def api_create_project(req: __import__("fastapi").Request):
 
 @app.get("/api/keys")
 async def api_list_keys(req: Request):
-
-    return JSONResponse({"keys":[k[:8]+"…"+k[-4:] for k in valid], "count":len(valid)})
+    keys = _load_api_keys()
+    return JSONResponse({"keys":[k[:8]+"…"+k[-4:] for k in keys], "count":len(keys)})
 
 @app.post("/api/keys")
 async def api_create_key(req: Request):
-
+    keys = _load_api_keys()
     newk="sk-"+__import__("secrets").token_urlsafe(32)
-    valid.add(newk); _save_api_keys(valid)
+    keys.add(newk); _save_api_keys(keys)
     return JSONResponse({"api_key":newk})
 
 # ── web app ───────────────────────────────────────────────────────────────
