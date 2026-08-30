@@ -905,6 +905,11 @@ class Vibes:
                 r = self.s.post(API + path, multipart=multipart,
                                 headers={"Accept": "*/*", "Referer": "https://vibes.ai/"},
                                 timeout=300)
+                if r.status_code == 401:
+                    if self._maybe_reauth():
+                        continue
+                    raise VibesError(f"POST {path}: 401 not authenticated",
+                                     status=401)
                 if r.status_code >= 400:
                     raise VibesError(f"POST {path}: {r.status_code} {r.text[:200]}",
                                      status=r.status_code)
