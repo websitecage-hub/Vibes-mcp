@@ -320,24 +320,20 @@ def _auth_post(s, url, data, referer):
         "Origin": "https://auth.meta.com", "Referer": referer, "X-ASBD-ID": "359341",
         "X-FB-LSD": data.get("lsd", ""), "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
-        "Sec-Ch-Ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
-        "Sec-Ch-Ua-Mobile": "?1", "Sec-Ch-Ua-Platform": '"Android"',
-        "Sec-Ch-Ua-Model": '"Pixel 9"', "Sec-Ch-Ua-Platform-Version": '"15"',
-        "Sec-Ch-Prefers-Color-Scheme": "dark", "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
-        "Priority": "u=1, i",
-        "Priority": "u=1, i",
         "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+        "sec-ch-ua-full-version-list": '"Not=A?Brand";v="99.0.0.0", "Google Chrome";v="151.0.7922.174", "Chromium";v="151.0.7922.174"',
         "sec-ch-ua-mobile": "?1",
         "sec-ch-ua-platform": '"Android"',
         "sec-ch-ua-platform-version": '"15"',
         "sec-ch-ua-model": '"Pixel 9"',
         "sec-ch-prefers-color-scheme": "dark",
-        "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8"}, allow_redirects=False, timeout=30)
+        "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+        "Priority": "u=1, i"}, allow_redirects=False, timeout=30)
 
 def _login_once(p_fn):
     """One OIDC login attempt -> curl_cffi Session with meta_session, or None.
     Choreography mirrored exactly from the successful incognito capture:
-    check-contact-point -> send-nonce -> api/login -> device-based/create."""
+    check-contact-point -> send-nonce -> api/login (password) -> device-based/create."""
     s = requests.Session(impersonate=IMPERSONATE)
     _seed_device_cookies(s)
     wf = str(uuid.uuid4())
@@ -367,6 +363,7 @@ def _login_once(p_fn):
     cp = {"account_reg_info[birthday]": datetime.utcnow().strftime("%Y-%m-%d"),
           "account_reg_info[device_id]": "", "account_reg_info[email]": EMAIL,
           "account_reg_info[first_name]": "", "account_reg_info[has_youth_consent]": "false",
+          "account_reg_info[is_bootstrap_flow]": "false",
           "account_reg_info[last_name]": "", "account_reg_info[pc_rendering_data]": "",
           "account_reg_info[phone_number]": "", "account_reg_info[registration_flow_id]": "",
           "allow_unconfirmed_email": "false", "check_for_pre_registration_restrictions": "true",
@@ -379,14 +376,16 @@ def _login_once(p_fn):
     _auth_post(s, "https://auth.meta.com/api/check-contact-point-availability/",
                cp, auth_url)
 
-    # 2) nonce init (no OTP entry needed; success:true expected)
+    # 2) nonce init (matches the successful browser capture; success:true expected.
+    #    Required so the password login below is recognized — omitting it trips
+    #    the 'unrecognized device' checkpoint 4652001.)
     sn = {"contact_point": EMAIL, "qpl_join_id": uuid.uuid4().hex[:16],
           "source_app_id": APP_ID, "waterfall_id": wf,
           "use_fb_cp_nonce": "false", "use_ig_cp_nonce": "false"}
     sn.update(base)
     _auth_post(s, "https://auth.meta.com/api/login-email-otp/send-nonce/", sn, auth_url)
 
-    # 3) password
+    # 3) password (email+password — no OTP code is ever entered)
     enc, _ = encrypt_password(PASSWORD, page["pk"], page["keyId"])
     pl = {"contact_point": EMAIL, "csi": csi, "encrypted_account_id": "",
           "is_contact_point_encrypted": "false", "is_parental_consent_flow": "false",

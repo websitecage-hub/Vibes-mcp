@@ -234,12 +234,7 @@ def _get_vibes():
                 return _vibes_client
             except Exception:  # noqa: BLE001
                 pass
-        # 2) try any individual meta_session candidate with full cookie array as context
-        #     (avoids the single-cookie device-mismatch checkpoint)
-        for val in _session_cookie_candidates():
-            # we already tried load_session above, so skip pure single-cookie unless needed
-            continue
-        # 3) full self-healing password flow (seeded device)
+        # 2) full self-healing password flow (seeded device)
         if hasattr(vibes_mod, "_fresh_client"):
             v = vibes_mod._fresh_client(quiet=True)
             if v is not None:
@@ -454,11 +449,25 @@ def _janitor_sweep():
 
 
 def _refresh_vibes_session():
-    """Proactive re-login before the cookie expires."""
+    """Keep the session alive WITHOUT forced re-login.
+
+    A full password login every cycle was triggering Meta's 'new device'
+    verification email repeatedly. Instead, only run the password flow when
+    the current session is actually dead/rejected; otherwise just confirm it
+    is still alive (a cheap authenticated probe) and leave it in place.
+    """
+    global _vibes_client
+    with _vibes_lock:
+        client = _vibes_client
+    if client is not None:
+        try:
+            client.me()           # cheap probe: still authenticated?
+            return True           # alive — nothing to do, no email sent
+        except Exception:
+            pass
     s = vibes_mod.auth.login_session(print_fn=lambda *a: None)
     if s is not None:
         vibes_mod.auth.save_session(s)
-        global _vibes_client
         with _vibes_lock:
             _vibes_client = vibes_mod.Vibes(s)
         return True
@@ -615,7 +624,7 @@ async def generate_image(prompt: str, project_id: str = "") -> list:
     try:
         hub = _get_hub_project(project_id) if project_id else None
         cid = hub["conversation_id"] if hub else None
-        res = await meta_ask("/imagine " + prompt, mode=mode if mode in ("instant","thinking") else "instant", timeout=int(body.get("timeout",180)), conversation_id=cid)
+        res = await meta_ask("/imagine " + prompt, mode="instant", timeout=180, conversation_id=cid)
         if hub:
             with PROJECTS_LOCK:
                 hub["history"].append({"prompt": prompt, "urls": [m["url"] for m in res["media"] if m.get("url")], "at": __import__("time").time()})
@@ -1345,7 +1354,6 @@ loadProjects();
 """
 
 
-@app.get("/app", response_class=HTMLResponse)
 @app.api_route("/app", methods=["GET", "HEAD"])
 async def web_app():
     return HTMLResponse(_APP_HTML)
