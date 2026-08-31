@@ -234,7 +234,19 @@ def _get_vibes():
                 return _vibes_client
             except Exception:  # noqa: BLE001
                 pass
-        # 2) full self-healing password flow (seeded device)
+        # 2) fall back to any distinct meta_session candidate (env/file/embedded)
+        #    — recovers when the materialized jar is poisoned but a raw cookie
+        #    value still works.
+        for val in _session_cookie_candidates():
+            try:
+                s2 = _try_vibes_cookie(val)
+                v = vibes_mod.Vibes(s2, reauth=True)
+                v.me()
+                _vibes_client = v
+                return _vibes_client
+            except Exception:  # noqa: BLE001
+                continue
+        # 3) full self-healing password flow (seeded device)
         if hasattr(vibes_mod, "_fresh_client"):
             v = vibes_mod._fresh_client(quiet=True)
             if v is not None:
@@ -452,31 +464,49 @@ def _refresh_vibes_session():
     """Keep the session alive WITHOUT forced re-login.
 
     A full password login every cycle was triggering Meta's 'new device'
-    verification email repeatedly. Instead, only run the password flow when
-    the current session is actually dead/rejected; otherwise just confirm it
-    is still alive (a cheap authenticated probe) and leave it in place.
+    verification email repeatedly. Instead, this only does a light
+    authenticated probe (which also makes Vibes rotate/persist any refreshed
+    cookie, sliding the session forward). A password login is attempted ONLY
+    when both the in-memory client and the on-disk session are dead.
     """
     global _vibes_client
     with _vibes_lock:
         client = _vibes_client
+    # 1) in-memory client still good?
     if client is not None:
         try:
-            client.me()           # cheap probe: still authenticated?
-            return True           # alive — nothing to do, no email sent
-        except Exception:
+            client.me()
+            return True
+        except Exception:  # noqa: BLE001
             pass
+    # 2) on-disk session still good (reload + probe, no login)
+    try:
+        s = vibes_mod.auth.load_session()
+        if s is not None:
+            v = vibes_mod.Vibes(s, reauth=True)
+            v.me()
+            with _vibes_lock:
+                _vibes_client = v
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    # 3) last resort: password login (seeded device cookies) + persist
     s = vibes_mod.auth.login_session(print_fn=lambda *a: None)
     if s is not None:
         vibes_mod.auth.save_session(s)
         with _vibes_lock:
-            _vibes_client = vibes_mod.Vibes(s)
+            _vibes_client = vibes_mod.Vibes(s, reauth=True)
         return True
     return False
 
 
 async def _session_refresher_loop():
+    # Probe often enough that the meta_session cookie slides forward on the
+    # authenticated `me()` calls, so it effectively never expires while the
+    # service is up. Only on a genuine multi-hour outage would a full
+    # password login be needed.
     while True:
-        await asyncio.sleep(4 * 3600)
+        await asyncio.sleep(20 * 60)
         try:
             await run_in_threadpool(_refresh_vibes_session)
         except Exception:  # noqa: BLE001
