@@ -1221,6 +1221,107 @@ async def api_create_key(req: Request):
     keys.add(newk); _save_api_keys(keys)
     return JSONResponse({"api_key":newk})
 
+# ── Meta AI LLM chat (thinking mode, model-API style) ─────────────────────
+# A clean text-LLM endpoint. ALWAYS runs in "thinking" mode (higher-quality
+# reasoned answers). Usable as a plain REST call AND as an OpenAI-compatible
+# /v1/chat/completions so any OpenAI SDK can point at it with just an API key.
+
+
+def _req_api_key(req):
+    h = (req.headers.get("authorization") or "").strip()
+    if h.lower().startswith("bearer "):
+        return h[7:].strip()
+    return (req.headers.get("x-api-key") or "").strip()
+
+
+def _authz_ok(k):
+    """Open by default; if MASTER_API_KEY is set, require an exact match."""
+    return True if not MASTER_API_KEY else k == MASTER_API_KEY
+
+
+@app.post("/api/chat")
+async def api_chat(req: Request):
+    """Chat with Meta AI's LLM in thinking mode. Returns plain JSON text."""
+    try:
+        body = await req.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    message = str(body.get("message") or body.get("prompt") or "").strip()
+    if not message:
+        return JSONResponse({"error": "message required"}, status_code=400)
+    cid = str(body.get("conversation_id") or "").strip() or None
+    timeout = int(body.get("timeout", 300))
+    try:
+        res = await meta_ask(message, mode="thinking", timeout=timeout,
+                             conversation_id=cid)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:300]}, status_code=500)
+    return JSONResponse({
+        "text": res["text"],
+        "model": "meta-ai",
+        "mode": "thinking",
+        "conversation_id": cid,
+        "media": res.get("media", []),
+    })
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(req: Request):
+    """OpenAI-compatible chat completion (always thinking mode).
+
+    Use with any OpenAI SDK: base_url = https://<host>/v1, api_key = sk-...
+    """
+    k = _req_api_key(req)
+    if not _authz_ok(k):
+        return JSONResponse({"error": {"message": "invalid api key",
+                                       "type": "invalid_request_error"}},
+                            status_code=401)
+    try:
+        body = await req.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    messages = body.get("messages")
+    if isinstance(messages, list) and messages:
+        content = ""
+        for m in messages:
+            if m.get("role") == "user":
+                content = m.get("content") or content
+        if not content and isinstance(messages[-1], dict):
+            content = messages[-1].get("content", "")
+        message = str(content or "").strip()
+    else:
+        message = str(body.get("message") or body.get("prompt") or "").strip()
+    if not message:
+        return JSONResponse({"error": "no message provided"}, status_code=400)
+    _model = str(body.get("model") or "meta-ai-thinking")
+    timeout = int(body.get("timeout", 300))
+    try:
+        res = await meta_ask(message, mode="thinking", timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:300]}, status_code=500)
+    return JSONResponse({
+        "id": "chatcmpl-" + uuid.uuid4().hex[:24],
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": _model,
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant", "content": res["text"]},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    })
+
+
+@app.get("/v1/models")
+async def openai_models(req: Request):
+    k = _req_api_key(req)
+    if not _authz_ok(k):
+        return JSONResponse({"error": {"message": "invalid api key",
+                                       "type": "invalid_request_error"}},
+                            status_code=401)
+    return JSONResponse({"object": "list", "data": [
+        {"id": "meta-ai-thinking", "object": "model", "owned_by": "meta"}
+    ]})
+
 # ── web app ───────────────────────────────────────────────────────────────
 
 _APP_HTML = """<!DOCTYPE html>
@@ -1250,6 +1351,10 @@ _APP_HTML = """<!DOCTYPE html>
   button.go:hover{background:#e5e5e5}button.go:disabled{opacity:.45;cursor:wait}
   #msg{margin-top:12px;font-size:13px;color:var(--dim);min-height:18px;white-space:pre-wrap}
   #msg.err{color:#f87171}
+  #chatout{margin-top:16px;display:flex;flex-direction:column;gap:10px}
+  #chatout .u,#chatout .a{max-width:86%;padding:11px 14px;border-radius:12px;font-size:14px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
+  #chatout .u{align-self:flex-end;background:#17304a;color:#e7f1ff}
+  #chatout .a{align-self:flex-start;background:#1f1f21;border:1px solid var(--border);color:var(--txt)}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;margin-top:18px}
   .grid img,.grid video{width:100%;border-radius:12px;border:1px solid var(--border);display:block;background:#000}
   a.dl{font-size:12px;color:var(--accent);text-decoration:none;display:inline-block;margin-top:6px}
@@ -1267,6 +1372,7 @@ _APP_HTML = """<!DOCTYPE html>
       <button class="tab on" data-m="image">Image</button>
       <button class="tab" data-m="video">Video</button>
       <button class="tab" data-m="animate">Animate image</button>
+      <button class="tab" data-m="chat">Chat</button>
     </div>
     <div class="projbar" id="projbar">
       <label>Project:</label>
@@ -1276,7 +1382,7 @@ _APP_HTML = """<!DOCTYPE html>
     </div>
     <textarea id="prompt" placeholder="Describe what you want — style stays consistent inside one project..."></textarea>
     <input class="url" id="refurl" placeholder="https://image-url-to-animate.jpg" style="display:none">
-    <div class="opts">
+    <div class="opts" id="opts">
       <select id="aspect"><option value="1:1">1:1 square</option><option value="9:16">9:16 vertical</option><option value="16:9">16:9 wide</option><option value="4:5">4:5 post</option><option value="3:4">3:4</option></select>
       <select id="res"><option value="480p">480p fast</option><option value="720p">720p</option><option value="1080p">1080p slow</option></select>
       <select id="model"><option value="">auto model</option><option value="midjen-short">midjen-short</option><option value="midjen-long">midjen-long</option><option value="midjen">midjen</option><option value="sora">sora</option><option value="veo">veo</option></select>
@@ -1284,6 +1390,7 @@ _APP_HTML = """<!DOCTYPE html>
     </div>
     <button class="go" id="go">Generate</button>
     <div id="msg"></div>
+    <div id="chatout" style="display:none"></div>
     <div class="grid" id="grid"></div>
     <div class="hist" id="hist" style="display:none"><h3>Project history</h3><div class="hgrid" id="hgrid"></div></div>
   </div>
@@ -1330,6 +1437,13 @@ function renderProjBar(){
   $('res').style.display = MODE==='image'?'none':'block';
   $('model').style.display = MODE==='image'?'none':'block';
   $('count').style.display = MODE==='image'?'none':'block';
+  const chat=MODE==='chat';
+  $('projbar').style.display=chat?'none':'flex';
+  $('opts').style.display=chat?'none':'flex';
+  $('hist').style.display=chat?'none':$('hist').style.display;
+  $('chatout').style.display=chat?'flex':'none';
+  $('prompt').placeholder=chat?'Ask Meta AI anything (thinking mode)…':'Describe what you want — style stays consistent inside one project...';
+  $('go').textContent=chat?'Send':'Generate';
 }
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
@@ -1357,11 +1471,27 @@ async function poll(jid){
   const pr=await fetch('/api/projects?kind='+MODE).then(r=>r.json());
   PROJECTS[MODE]=pr.projects; renderProjBar();
 }
+let CHAT_CID=null;
 $('go').onclick=async()=>{
   const p=$('prompt').value.trim(); if(!p) return;
   const pid=ACTIVE[MODE];
   $('go').disabled=true; $('msg').className=''; $('msg').textContent='Starting...';
   try{
+    if(MODE==='chat'){
+      const d=document.createElement('div'); d.className='u'; d.textContent=p;
+      $('chatout').appendChild(d); $('prompt').value='';
+      $('msg').textContent='Thinking…'; $('go').disabled=false;
+      const body={message:p,model:'meta-ai'};
+      if(CHAT_CID)body.conversation_id=CHAT_CID;
+      const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j=await r.json(); $('msg').textContent='';
+      if(j.error){$('msg').textContent=j.error;$('msg').className='err';return;}
+      if(j.conversation_id)CHAT_CID=j.conversation_id;
+      const a=document.createElement('div'); a.className='a'; a.textContent=j.text||'(no response)';
+      $('chatout').appendChild(a);
+      $('chatout').scrollTop=$('chatout').scrollHeight;
+      return;
+    }
     if(MODE==='image'){
       const r=await fetch('/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,project_id:pid})});
       const j=await r.json(); $('go').disabled=false;

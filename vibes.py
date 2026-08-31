@@ -218,9 +218,9 @@ from curl_cffi import requests
 from nacl.public import SealedBox, PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-EMAIL    = "anshuminded@gmail.com"
-PASSWORD = "Anshusingh99"
-APP_ID   = "1301537925115840"
+EMAIL    = os.environ.get("META_EMAIL", "anshuminded@gmail.com")
+PASSWORD = os.environ.get("META_PASSWORD", "Anshusingh99")
+APP_ID   = os.environ.get("VIBES_APP_ID", "1301537925115840")
 IMPERSONATE = "chrome_android"
 SESSION_FILE = os.path.join(ROOT_DIR, "session.json")
 # Identity mirrored EXACTLY from the successful incognito login HAR:
