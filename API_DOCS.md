@@ -175,6 +175,50 @@ UI uses this automatically for Download buttons.
 
 ---
 
+## 5b. File Upload
+
+### POST /api/upload
+Upload a file and get back usable handles for **both** backends at once:
+
+| Field | Backend | Use |
+|---|---|---|
+| `media_id` | Meta AI | `edit_image` / image chat attachment |
+| `url` | Vibes AI | pass as `reference_image_url` / `image_url` to video/animate/edit |
+| `mediaEntId` | Vibes AI | project asset id |
+| `uploadToken` | Vibes AI | upload token |
+
+**Multipart upload:**
+
+```bash
+curl -X POST https://media-gen-mcp.onrender.com/api/upload \
+  -F "file=@photo.jpg"
+```
+
+**Response:**
+
+```json
+{
+  "filename": "photo.jpg",
+  "mime_type": "image/jpeg",
+  "size": 52301,
+  "media_id": 1515559373663074,
+  "url": "https://scontent-...fbcdn.net/...jpg",
+  "mediaEntId": "1327665380428380",
+  "uploadToken": "..."
+}
+```
+
+Then feed `url` straight into image-to-video / animate / edit:
+
+```bash
+# use the uploaded image as a reference for video
+curl -X POST https://media-gen-mcp.onrender.com/api/video \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"animate this","reference_image_url":"https://scontent-...jpg"}'
+```
+
+---
+
 ## 6. MCP (for Claude / ChatGPT)
 
 **Endpoint:** `POST https://media-gen-mcp.onrender.com/mcp` — Streamable HTTP, stateless, no auth.
