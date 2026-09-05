@@ -1,5 +1,6 @@
 fastapi>=0.115
 uvicorn>=0.32
+python-multipart>=0.0.9
 mcp[cli]>=1.10,<2
 curl_cffi>=0.7
 websockets>=13.0

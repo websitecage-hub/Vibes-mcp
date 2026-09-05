@@ -1083,8 +1083,44 @@ async def health():
 
 # ── REST API for the web app ─────────────────────────────────────────────
 
-from fastapi import Request
+from fastapi import Request, File, UploadFile
 from fastapi.responses import HTMLResponse
+
+
+@app.post("/api/upload")
+async def api_upload(file: UploadFile = File(...)):
+    """Upload a file and get back usable handles for BOTH backends:
+    - meta.ai:  `media_id` (for edit_image / image chat attachment)
+    - vibes.ai: `url` + `mediaEntId` (use `url` as reference_image_url / image_url)
+    """
+    import mimetypes
+    data = await file.read()
+    suffix = os.path.splitext(file.filename or "")[1] or ".bin"
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    os.write(fd, data)
+    os.close(fd)
+    fname = file.filename or "upload"
+    mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+    result = {"filename": fname, "mime_type": mime, "size": len(data)}
+    try:
+        token = meta_client.load_token()
+        if token:
+            result["media_id"] = meta_client.upload_file(tmp, token)
+    except Exception as e:  # noqa: BLE001
+        result["meta_error"] = str(e)[:120]
+    try:
+        v = _get_vibes()
+        media = v.upload_media(tmp)
+        result["url"] = media.get("cdnUrl") or media.get("imageUrl")
+        result["mediaEntId"] = media.get("mediaEntId")
+        result["uploadToken"] = media.get("uploadToken")
+    except Exception as e:  # noqa: BLE001
+        result["vibes_error"] = str(e)[:120]
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return JSONResponse(result)
 
 
 @app.post("/api/image")
